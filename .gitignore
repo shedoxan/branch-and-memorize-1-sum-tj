@@ -1,0 +1,17 @@
+build/
+x64/
+compare_out/
+results/
+.vs/
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.obj
+*.o
+*.exe
+*.ilk
+*.pdb
+*.user
+*.log
+*.csv
