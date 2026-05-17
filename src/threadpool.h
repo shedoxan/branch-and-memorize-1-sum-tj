@@ -13,9 +13,15 @@
 #include <utility>
 #include <vector>
 
+/// Служебный пул потоков
+/// Запускает независимые экземпляры задачи параллельно.
+/// Не участвует в рекурсии Branch-and-Memorize и не меняет exactness solver-а.
 class ThreadPool {
 public:
+	/// Создаёт num_threads рабочих потоков; значение 0 трактуется как 1.
 	explicit ThreadPool(std::size_t num_threads);
+
+	/// Дожидается завершения уже взятых задач и останавливает рабочие потоки.
 	~ThreadPool();
 
 	ThreadPool(const ThreadPool&) = delete;
@@ -46,11 +52,17 @@ public:
 	}
 
 private:
+	/// Основной цикл рабочего потока: ждать задачу, забрать её из очереди, выполнить.
 	void worker_loop();
 
+	/// Рабочие потоки.
 	std::vector<std::thread> workers_;
+	/// Очередь независимых задач.
 	std::queue<std::function<void()>> tasks_;
+	/// Защищает очередь задач и флаг остановки.
 	std::mutex queue_mutex_;
+	/// Будит worker-ы при появлении задач или остановке.
 	std::condition_variable condition_;
+	/// Флаг завершения: новые задачи больше не принимаются.
 	bool stopping_ = false;
 };

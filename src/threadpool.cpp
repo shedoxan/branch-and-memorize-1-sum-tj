@@ -11,6 +11,8 @@ ThreadPool::ThreadPool(std::size_t num_threads) {
 			workers_.emplace_back(&ThreadPool::worker_loop, this);
 		}
 	} catch (...) {
+		// Если создание одного из потоков не удалось, уже созданные потоки
+		// нужно корректно остановить, иначе конструктор оставит висячую работу.
 		{
 			std::lock_guard<std::mutex> lock(queue_mutex_);
 			stopping_ = true;
@@ -46,6 +48,7 @@ void ThreadPool::worker_loop() {
 		{
 			std::unique_lock<std::mutex> lock(queue_mutex_);
 			condition_.wait(lock, [this]() { return stopping_ || !tasks_.empty(); });
+			// При остановке worker завершает цикл только после обработки уже поставленных задач.
 			if (stopping_ && tasks_.empty()) {
 				return;
 			}

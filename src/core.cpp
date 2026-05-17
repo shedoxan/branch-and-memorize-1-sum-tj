@@ -4,19 +4,22 @@
 #include <sstream>
 #include <utility>
 
-schedule_cost_t tardiness(schedule_time_t completion_time, due_date_t due_date) {
-	return (completion_time > due_date) ? (completion_time - due_date) : 0;
+schedule_cost_t tardiness(schedule_time_t completion_C, due_date_t due_date_d) {
+    // Запаздывание одной работы:
+    // T_j = max(C_j - d_j, 0).
+	return (completion_C > due_date_d) ? (completion_C - due_date_d) : 0;
 }
 
-schedule_cost_t evaluate_sum_tardiness(const instance& inst, const std::vector<int>& order) {
-	schedule_time_t t = 0;
-	schedule_cost_t sum = 0;
-	for (int i : order) {
-		const std::size_t idx = static_cast<std::size_t>(i);
-		t += inst.jobs[idx].p;
-		sum += tardiness(t, inst.jobs[idx].d);
+schedule_cost_t evaluate_sum_tardiness(const instance& inst, const std::vector<job_id_t>& order, schedule_time_t start_t) {
+	schedule_time_t completion_C = start_t;
+	schedule_cost_t sum_T = 0;
+	for (job_id_t job_id : order) {
+		const std::size_t idx = static_cast<std::size_t>(job_id);
+		// C_j(pi) накапливается как сумма p_j по префиксу расписания pi.
+		completion_C += inst.jobs[idx].p;
+		sum_T += tardiness(completion_C, inst.jobs[idx].d);
 	}
-	return sum;
+	return sum_T;
 }
 
 bool parse_instance(std::istream& in, instance& out, std::string* error) {
@@ -96,6 +99,7 @@ bool parse_instance(std::istream& in, instance& out, std::string* error) {
 		}
 
 		total_processing_time += p_value;
+	
 		if (total_processing_time > std::numeric_limits<int>::max()) {
 			if (error) {
 				*error = "Total processing time exceeds supported limit.";

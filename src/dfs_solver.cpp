@@ -2,10 +2,12 @@
 
 #include <bit>
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cctype>
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -15,58 +17,164 @@ std::string normalize_text(std::string text) {
 	}
 	return text;
 }
+
+bool any_terminal_rule_enabled(const terminal_rules_config& terminal_rules) {
+	return terminal_rules.enable_all_tardy_spt ||
+		terminal_rules.enable_edd_at_most_one_tardy;
+}
+
+bool any_lb_enabled(const dfs_config& config) {
+	return config.bounds.enable_simple_lb ||
+		(config.memo.enable_memo &&
+			(config.bounds.enable_lb_memo || config.memo.enable_lb_memo));
+}
+
+bool any_ub_enabled(const bounds_config& bounds) {
+	return bounds.enable_edd_ub;
+}
+
+bool depth_allowed(int depth, int limit) {
+	return limit < 0 || depth <= limit;
+}
+
+bool position_filtering_enabled(const dfs_config& config) {
+	return config.position_filtering.enabled;
+}
+
+bool lawler_basic_position_filter_enabled(const dfs_config& config) {
+	return position_filtering_enabled(config) &&
+		config.position_filtering.enable_lawler_basic_rules;
+}
+
+bool lawler_rule4_position_filter_enabled(const dfs_config& config) {
+	return position_filtering_enabled(config) &&
+		config.position_filtering.enable_rule4;
+}
+
+bool szwarc_rule4_position_filter_enabled(const dfs_config& config) {
+	return position_filtering_enabled(config) &&
+		config.position_filtering.enable_rule4;
+}
+
+void validate_solver_config(const dfs_config& config) {
+	if (!config.memo.full_key_verification) {
+		throw std::runtime_error("Memo without full-key verification is disabled in the exact course build");
+	}
+	(void)config;
+}
 } // namespace
 
-const char* to_string(decomposition_policy policy) {
-	switch (policy) {
-	case decomposition_policy::adaptive:
+const char* to_string(DecompositionMode mode) {
+	switch (mode) {
+	case DecompositionMode::Adaptive:
 		return "adaptive";
-	case decomposition_policy::lawler:
+	case DecompositionMode::Lawler:
 		return "lawler";
-	case decomposition_policy::szwarc:
+	case DecompositionMode::Szwarc:
 		return "szwarc";
-	case decomposition_policy::both:
+	case DecompositionMode::BothLawlerSzwarc:
 		return "both";
 	default:
 		return "unknown";
 	}
 }
 
-bool parse_decomposition_policy(const std::string& text, decomposition_policy& out) {
+bool parse_decomposition_mode(const std::string& text, DecompositionMode& out) {
 	const std::string v = normalize_text(text);
-	if (v == "adaptive" || v == "auto") {
-		out = decomposition_policy::adaptive;
+	if (v == "adaptive") {
+		out = DecompositionMode::Adaptive;
 		return true;
 	}
 	if (v == "lawler") {
-		out = decomposition_policy::lawler;
+		out = DecompositionMode::Lawler;
 		return true;
 	}
 	if (v == "szwarc") {
-		out = decomposition_policy::szwarc;
+		out = DecompositionMode::Szwarc;
 		return true;
 	}
 	if (v == "both") {
-		out = decomposition_policy::both;
+		out = DecompositionMode::BothLawlerSzwarc;
+		return true;
+	}
+	return false;
+}
+
+const char* to_string(memo_backend_kind backend) {
+	switch (backend) {
+	case memo_backend_kind::custom:
+		return "custom";
+	case memo_backend_kind::std_unordered:
+		return "std_unordered";
+	default:
+		return "unknown";
+	}
+}
+
+bool parse_memo_backend_kind(const std::string& text, memo_backend_kind& out) {
+	const std::string v = normalize_text(text);
+	if (v == "custom" || v == "current") {
+		out = memo_backend_kind::custom;
+		return true;
+	}
+	if (v == "std_unordered" || v == "std-unordered" || v == "unordered" || v == "reference") {
+		out = memo_backend_kind::std_unordered;
+		return true;
+	}
+	return false;
+}
+
+const char* to_string(adaptive_policy_kind policy) {
+	switch (policy) {
+	case adaptive_policy_kind::v1:
+		return "v1";
+	case adaptive_policy_kind::v2:
+		return "v2";
+	case adaptive_policy_kind::v3:
+		return "v3";
+	default:
+		return "unknown";
+	}
+}
+
+bool parse_adaptive_policy_kind(const std::string& text, adaptive_policy_kind& out) {
+	const std::string v = normalize_text(text);
+	if (v == "v1") {
+		out = adaptive_policy_kind::v1;
+		return true;
+	}
+	if (v == "v2") {
+		out = adaptive_policy_kind::v2;
+		return true;
+	}
+	if (v == "v3") {
+		out = adaptive_policy_kind::v3;
 		return true;
 	}
 	return false;
 }
 
 dfs_solver::dfs_solver(dfs_config config)
-	: config_(config), memo_(config.memo_capacity) {}
+	: config_(config), memo_(config.memo.backend, config.memo.capacity) {}
 
 solve_result dfs_solver::solve(const instance& inst) {
+	validate_solver_config(config_);
+
 	inst_ = &inst;
 	n_ = static_cast<int>(inst.jobs.size());
 	stats_ = {};
+	stats_.adaptive_policy_used = static_cast<std::uint64_t>(config_.adaptive_policy);
 
 	memo_.clear();
 	memo_.set_profiling_timers_enabled(config_.profiling.enabled);
-	memo_.set_capacity(config_.memo_capacity, false);
-	memo_.set_memory_budget_bytes(config_.memo_memory_budget_bytes, config_.strict_memory_cap);
-	memo_.set_process_memory_gate(config_.use_process_memory_gate);
-	memo_.set_lufo_exact_protection(config_.use_lufo_exact_protection);
+	// Если нужен порядок, важно сохранить цепочку exact-записей с best_job.
+	// Поэтому ограничение по числу memo entries отключается только для reconstruction;
+	// memory budget, если он задан, продолжает действовать.
+	const std::size_t effective_memo_capacity =
+		config_.reconstruct_order ? 0 : config_.memo.capacity;
+	memo_.set_capacity(effective_memo_capacity, false);
+	memo_.set_memory_budget_bytes(config_.memo.memory_limit_bytes, config_.memo.strict_memory_cap);
+	memo_.set_process_memory_gate(config_.memo.use_process_memory_gate);
 
 	initialize_runtime_state(inst);
 
@@ -80,6 +188,15 @@ solve_result dfs_solver::solve(const instance& inst) {
 	}
 
 	const auto start = std::chrono::steady_clock::now();
+	solve_start_ = start;
+	has_time_limit_ = config_.time_limit_sec > 0.0;
+	time_check_counter_ = 1023;
+	if (has_time_limit_) {
+		const auto limit = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+			std::chrono::duration<double>(config_.time_limit_sec));
+		deadline_ = solve_start_ + limit;
+	}
+	// Корневая подзадача: S = N, t = 0.
 	const long long optimal = solve_state(0, 0, nullptr, true);
 	const auto finish = std::chrono::steady_clock::now();
 	stats_.elapsed_ms = std::chrono::duration<double, std::milli>(finish - start).count();
@@ -88,11 +205,13 @@ solve_result dfs_solver::solve(const instance& inst) {
 		result.best.order = reconstruct_order(optimal);
 	}
 	result.best.cost = static_cast<schedule_cost_t>(optimal);
+	bool reconstruction_ok = false;
 	if (result.best.order.size() == static_cast<std::size_t>(n_)) {
 		const schedule_cost_t reconstructed_cost = evaluate_sum_tardiness(inst, result.best.order);
-		if (reconstructed_cost != static_cast<schedule_cost_t>(optimal)) {
-			result.best.order.clear();
-		}
+		reconstruction_ok = reconstructed_cost == static_cast<schedule_cost_t>(optimal);
+	}
+	if (config_.reconstruct_order && !reconstruction_ok) {
+		result.best.order.clear();
 	}
 
 	finalize_stats_from_memo();
@@ -109,6 +228,7 @@ void dfs_solver::initialize_runtime_state(const instance& inst) {
 		runtime_.edd_order[static_cast<std::size_t>(j)] = j;
 		runtime_.lpt_order[static_cast<std::size_t>(j)] = j;
 	}
+	// EDD(S): порядок неубывания d_j; tie-break по p_j нужен для теоремы Lawler.
 	std::sort(runtime_.edd_order.begin(), runtime_.edd_order.end(), [&](int a, int b) {
 		const job& ja = inst.jobs[static_cast<std::size_t>(a)];
 		const job& jb = inst.jobs[static_cast<std::size_t>(b)];
@@ -120,6 +240,7 @@ void dfs_solver::initialize_runtime_state(const instance& inst) {
 		}
 		return a < b;
 		});
+	// LPT используется для выбора [q]_S с максимальным p_j и для списка кандидатов Decomposition II.
 	std::sort(runtime_.lpt_order.begin(), runtime_.lpt_order.end(), [&](int a, int b) {
 		const job& ja = inst.jobs[static_cast<std::size_t>(a)];
 		const job& jb = inst.jobs[static_cast<std::size_t>(b)];
@@ -133,6 +254,7 @@ void dfs_solver::initialize_runtime_state(const instance& inst) {
 		});
 	stats_.ordering_sorts += 2;
 
+	// S в подзадаче (S,t): единичный бит означает, что работа еще не упорядочена.
 	const std::size_t words = static_cast<std::size_t>((n_ + 63) / 64);
 	runtime_.remaining_bits.assign(words, 0);
 	for (int j = 0; j < n_; ++j) {
@@ -142,6 +264,7 @@ void dfs_solver::initialize_runtime_state(const instance& inst) {
 	}
 	runtime_.remaining_count = n_;
 
+	// Zobrist hash/fingerprint для множества S; полный bitset хранится для проверки коллизий.
 	runtime_.zobrist_job.assign(static_cast<std::size_t>(n_), 0);
 	runtime_.zobrist_job_fp.assign(static_cast<std::size_t>(n_), 0);
 	std::mt19937_64 rng(config_.zobrist_seed);
@@ -165,25 +288,26 @@ void dfs_solver::initialize_runtime_state(const instance& inst) {
 
 	runtime_.scratch_by_depth.clear();
 	runtime_.scratch_by_depth.resize(static_cast<std::size_t>(n_ + 1));
-	for (dfs_depth_scratch& scratch : runtime_.scratch_by_depth) {
-		scratch.edd_jobs.reserve(static_cast<std::size_t>(n_));
-		scratch.lpt_jobs.reserve(static_cast<std::size_t>(n_));
+	runtime_.estimated_branches_by_depth.assign(static_cast<std::size_t>(n_ + 1), 0);
+	for (int depth = 0; depth <= n_; ++depth) {
+		dfs_depth_scratch& scratch = runtime_.scratch_by_depth[static_cast<std::size_t>(depth)];
+		const std::size_t max_remaining_here = static_cast<std::size_t>(n_ - depth);
+		scratch.edd_jobs.reserve(max_remaining_here);
+		scratch.lpt_jobs.reserve(max_remaining_here);
 		scratch.order_cache_ready = false;
 		scratch.order_cache_hash = 0;
 		scratch.order_cache_fingerprint = 0;
 		scratch.order_cache_count = -1;
-		scratch.longest_positions.reserve(static_cast<std::size_t>(n_));
-		scratch.edd_prefix_processing.reserve(static_cast<std::size_t>(n_ + 1));
+		scratch.lawler_r_positions.reserve(max_remaining_here);
+		scratch.edd_prefix_p.reserve(max_remaining_here + 1);
 
-		scratch.candidates_before_earliest.reserve(static_cast<std::size_t>(n_));
-		scratch.szwarc_positions.reserve(static_cast<std::size_t>(n_));
-		scratch.before_prefix.reserve(static_cast<std::size_t>(n_ + 1));
-		scratch.tni_values.reserve(static_cast<std::size_t>(n_));
+		scratch.candidates_before_earliest.reserve(max_remaining_here);
+		scratch.szwarc_positions.reserve(max_remaining_here);
+		scratch.before_prefix.reserve(max_remaining_here + 1);
+		scratch.trial_tardiness_values.reserve(max_remaining_here);
 		scratch.candidate_marks.assign(static_cast<std::size_t>(n_), 0);
 		scratch.candidate_mark_epoch = 1;
 
-		scratch.tmp_b_jobs.reserve(static_cast<std::size_t>(n_));
-		scratch.tmp_a_jobs.reserve(static_cast<std::size_t>(n_));
 
 		scratch.prefix_bits.assign(words, 0);
 		scratch.b_bits.assign(words, 0);
@@ -200,8 +324,14 @@ void dfs_solver::finalize_stats_from_memo() {
 	stats_.memo_hits = table_stats.hits;
 	stats_.memo_misses = table_stats.misses;
 	stats_.memo_inserts = table_stats.inserts;
+	stats_.memo_exact_stores = table_stats.exact_stores;
+	stats_.memo_lb_stores = table_stats.lb_stores;
+	stats_.memo_stores_exact = stats_.memo_exact_stores;
+	stats_.memo_stores_lb = stats_.memo_lb_stores;
 	stats_.memo_updates = table_stats.updates;
 	stats_.memo_evictions = table_stats.evictions;
+	stats_.memo_evictions_exact = table_stats.evictions_exact;
+	stats_.memo_evictions_lb = table_stats.evictions_lb;
 	stats_.memo_rejected_no_room = table_stats.rejected_no_room;
 	stats_.memo_forced_evictions = table_stats.forced_evictions;
 	stats_.memo_clean_calls = table_stats.clean_calls;
@@ -210,12 +340,31 @@ void dfs_solver::finalize_stats_from_memo() {
 	stats_.memo_final_size = table_stats.final_size;
 
 	stats_.memo_used_bytes = mem_stats.used_bytes;
+	stats_.memo_memory_used_bytes = mem_stats.used_bytes;
 	stats_.memo_budget_bytes = mem_stats.budget_bytes;
 	stats_.memo_clean_time_ms = table_stats.clean_time_ms;
+	stats_.cleanup_time_ms = stats_.memo_clean_time_ms;
 
 	stats_.duplicate_subproblem_hits = diags.duplicate_subproblem_hits;
 	stats_.hash_collisions = diags.hash_collisions;
 	stats_.full_key_rechecks = diags.full_key_rechecks;
+}
+
+void dfs_solver::check_time_limit() {
+	if (!has_time_limit_) {
+		return;
+	}
+	if ((++time_check_counter_ & 1023ULL) != 0ULL) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now < deadline_) {
+		return;
+	}
+
+	stats_.elapsed_ms = std::chrono::duration<double, std::milli>(now - solve_start_).count();
+	finalize_stats_from_memo();
+	throw solver_time_limit_exceeded(stats_);
 }
 
 void dfs_solver::build_jobs_in_order_for_bits(const std::vector<int>& source_order,
@@ -239,16 +388,29 @@ void dfs_solver::build_remaining_jobs_in_order(const std::vector<int>& global_or
 	build_jobs_in_order_for_bits(global_order, runtime_.remaining_bits, runtime_.remaining_count, out);
 }
 
+/// Рекурсивное ядро Branch-and-Memorize.
+///
+/// Инвариант входа: runtime_.remaining_bits задаёт текущее множество S,
+/// current_time задаёт t, а depth равен длине уже зафиксированного префикса расписания.
+/// Возвращаемое значение — OPT(S,t), то есть минимальная дополнительная сумма T_j
+/// для работ из S при старте в момент t. Ключ exact memo обязан включать t:
+/// одно и то же S при разных t даёт разные C_j и, следовательно, разные T_j.
+///
+/// Общая схема: lookup M[(S,t)] -> terminal/bounds -> построение ветвей ->
+/// рекурсивное решение подмножеств -> store exact M[(S,t)].
 long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const memo_lookup_result* known_lookup,
 	bool track_stats) {
+	// current_time -- это t в подзадаче OPT(S,t), S задано runtime_.remaining_bits.
 	const bool profiling_timers = track_stats && config_.profiling.enabled;
 	if (track_stats) {
 		++stats_.nodes;
+		++stats_.recursive_calls;
 		const std::uint64_t depth_u64 = static_cast<std::uint64_t>(depth);
 		if (depth_u64 > stats_.max_depth) {
 			stats_.max_depth = depth_u64;
 		}
 	}
+	check_time_limit();
 
 	const int remaining_count = runtime_.remaining_count;
 	if (remaining_count == 0 || depth >= n_) {
@@ -258,10 +420,13 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 		return 0;
 	}
 
+	// Solution memorization: exact-запись M[(S,t)] полностью закрывает подзадачу.
+	// LB-запись здесь не достаточна: она даёт только нижнюю оценку, а не OPT(S,t).
 	memo_lookup_result lookup = known_lookup ? *known_lookup : memo_lookup_result{};
 	if (lookup.found && lookup.has_exact) {
 		if (track_stats) {
 			++stats_.pruned_by_memo_exact;
+			++stats_.memo_exact_hits;
 		}
 		return lookup.exact;
 	}
@@ -272,6 +437,7 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 	if (lookup.found && lookup.has_exact) {
 		if (track_stats) {
 			++stats_.pruned_by_memo_exact;
+			++stats_.memo_exact_hits;
 		}
 		return lookup.exact;
 	}
@@ -307,17 +473,61 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 		scratch.order_cache_count = remaining_count;
 	}
 
-	const bool use_lower_bound_here = config_.use_lower_bounds;
-	long long state_lb = 0;
+	if (any_terminal_rule_enabled(config_.terminal_rules)) {
+		// Terminal rules дают точное значение OPT(S,t) без дальнейшего ветвления.
+		const auto terminal_start = profiling_timers
+			? std::chrono::steady_clock::now()
+			: std::chrono::steady_clock::time_point{};
+		long long terminal_exact = 0;
+		int terminal_first = -1;
+		std::uint64_t* terminal_counter = nullptr;
+		if (try_terminal_rules(depth, current_time, edd_jobs, lpt_jobs,
+			terminal_exact, terminal_first, terminal_counter)) {
+			if (track_stats && terminal_counter != nullptr) {
+				++(*terminal_counter);
+			}
+			if (profiling_timers) {
+				const auto terminal_finish = std::chrono::steady_clock::now();
+				stats_.terminal_time_ms += std::chrono::duration<double, std::milli>(terminal_finish - terminal_start).count();
+			}
+			store_exact_memo(current_time, terminal_exact, terminal_first, track_stats);
+			return terminal_exact;
+		}
+		if (profiling_timers) {
+			const auto terminal_finish = std::chrono::steady_clock::now();
+			stats_.terminal_time_ms += std::chrono::duration<double, std::milli>(terminal_finish - terminal_start).count();
+		}
+	}
+
+	const bool lb_depth_ok = depth_allowed(depth, config_.bounds.lb_depth_limit);
+	const bool ub_depth_ok = depth_allowed(depth, config_.bounds.ub_depth_limit);
+	const bool use_simple_lb_here = lb_depth_ok && config_.bounds.enable_simple_lb;
+	const bool use_lb_memo_here = lb_depth_ok && config_.memo.enable_memo &&
+		(config_.memo.enable_lb_memo || config_.bounds.enable_lb_memo);
+	const bool use_lower_bound_here = use_simple_lb_here || use_lb_memo_here;
+	const bool use_upper_bound_here = ub_depth_ok && any_ub_enabled(config_.bounds);
+	long long lower_bound_LB = 0;
 	if (use_lower_bound_here) {
+		// LB(S,t) обязана быть admissible: LB <= OPT(S,t). Иначе можно ошибочно
+		// отсечь оптимальную ветвь. Текущая LB дешёвая и не является полной LB1/LB2 из конспекта.
 		const auto bound_start = profiling_timers
 			? std::chrono::steady_clock::now()
 			: std::chrono::steady_clock::time_point{};
-		state_lb = lower_bound_additional(depth, current_time);
-		if (lookup.found && lookup.lower_bound > state_lb) {
-			state_lb = lookup.lower_bound;
+		if (use_simple_lb_here) {
+			if (track_stats) {
+				++stats_.simple_lb_calls;
+			}
+			lower_bound_LB = lower_bound_additional(depth, current_time);
 		}
-		store_lower_bound_memo(current_time, state_lb, track_stats);
+		if (use_lb_memo_here && lookup.found && lookup.lower_bound > lower_bound_LB) {
+			lower_bound_LB = lookup.lower_bound;
+			if (track_stats) {
+				++stats_.memo_lb_hits;
+			}
+		}
+		if (use_simple_lb_here) {
+			store_lower_bound_memo(current_time, lower_bound_LB, track_stats);
+		}
 		if (profiling_timers) {
 			const auto bound_finish = std::chrono::steady_clock::now();
 			stats_.bound_time_ms += std::chrono::duration<double, std::milli>(bound_finish - bound_start).count();
@@ -325,32 +535,59 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 	}
 
 	int first_job = -1;
-	long long best_additional = std::numeric_limits<long long>::max() / 4;
+	long long upper_bound_UB = std::numeric_limits<long long>::max() / 4;
 	int best_first_job = -1;
-	if (use_lower_bound_here) {
-		best_additional = heuristic_upper_bound_edd(depth, current_time, edd_jobs, &first_job);
+	if (use_upper_bound_here) {
+		// UB строится из допустимого расписания-продолжения, поэтому UB >= OPT(S,t).
+		// Такой incumbent безопасен: он только помогает отсекать ветви с LB >= UB.
+		const auto ub_start = profiling_timers
+			? std::chrono::steady_clock::now()
+			: std::chrono::steady_clock::time_point{};
+		upper_bound_UB = heuristic_upper_bound_edd(depth, current_time, edd_jobs, &first_job, track_stats);
+		if (track_stats) {
+			++stats_.ub_calls;
+			if (upper_bound_UB < std::numeric_limits<long long>::max() / 4) {
+				++stats_.ub_improvements;
+			}
+		}
 		best_first_job = first_job;
+		if (profiling_timers) {
+			const auto ub_finish = std::chrono::steady_clock::now();
+			stats_.upper_bound_time_ms += std::chrono::duration<double, std::milli>(ub_finish - ub_start).count();
+		}
 	}
 
-	if (use_lower_bound_here
+	if (use_lb_memo_here
 		&& lookup.found
 		&& !lookup.has_exact
-		&& lookup.lower_bound >= best_additional) {
+		&& lookup.lower_bound >= upper_bound_UB) {
 		if (track_stats) {
 			++stats_.pruned_by_memo_lb;
+			++stats_.branches_pruned;
+			++stats_.lb_prunes;
 		}
-		store_exact_memo(current_time, best_additional, best_first_job, track_stats);
-		return best_additional;
+		store_exact_memo(current_time, upper_bound_UB, best_first_job, track_stats);
+		return upper_bound_UB;
 	}
 
-	if (use_lower_bound_here && state_lb >= best_additional) {
-		store_exact_memo(current_time, best_additional, best_first_job, track_stats);
-		return best_additional;
+	if (use_lower_bound_here && lower_bound_LB >= upper_bound_UB) {
+		if (track_stats) {
+			++stats_.branches_pruned;
+			++stats_.lb_prunes;
+			if (use_simple_lb_here) {
+				++stats_.simple_lb_prunes;
+			}
+		}
+		store_exact_memo(current_time, upper_bound_UB, best_first_job, track_stats);
+		return upper_bound_UB;
 	}
 
+	// Decomposition I (Lawler) выбирает [q]_S: работу с максимальным p_j в локальном S.
+	// Decomposition II (Szwarc) выбирает [1]_S: первую работу в EDD(S), то есть min d_j.
 	const int longest_job = lpt_jobs.front();
 	const int earliest_job = edd_jobs.front();
 	const job* const jobs = inst_->jobs.data();
+	// q -- позиция выбранной самой длинной работы [q]_S в локальном EDD(S).
 	int longest_pos_in_edd = 0;
 	for (int i = 0; i < static_cast<int>(edd_jobs.size()); ++i) {
 		if (edd_jobs[static_cast<std::size_t>(i)] == longest_job) {
@@ -367,24 +604,27 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 		}
 	}
 
-	std::vector<long long>& edd_prefix_processing = scratch.edd_prefix_processing;
-	edd_prefix_processing.resize(edd_jobs.size() + 1);
-	edd_prefix_processing[0] = 0;
+	// P_r = sum_{h=1}^r p_[h]_S для локального EDD(S), с нулевой базой индексов.
+	std::vector<long long>& edd_prefix_p = scratch.edd_prefix_p;
+	edd_prefix_p.resize(edd_jobs.size() + 1);
+	edd_prefix_p[0] = 0;
 	for (int i = 0; i < static_cast<int>(edd_jobs.size()); ++i) {
-		edd_prefix_processing[static_cast<std::size_t>(i + 1)] =
-			edd_prefix_processing[static_cast<std::size_t>(i)] +
+		edd_prefix_p[static_cast<std::size_t>(i + 1)] =
+			edd_prefix_p[static_cast<std::size_t>(i)] +
 			static_cast<long long>(jobs[static_cast<std::size_t>(
 				edd_jobs[static_cast<std::size_t>(i)])].p);
 	}
 
-	std::vector<int>& longest_positions = scratch.longest_positions;
-	std::vector<long long>& tni_values = scratch.tni_values;
-	longest_positions.clear();
-	const bool use_article_rule4 = true;
+	std::vector<int>& lawler_r_positions = scratch.lawler_r_positions;
+	std::vector<long long>& trial_tardiness_values = scratch.trial_tardiness_values;
+	lawler_r_positions.clear();
+	trial_tardiness_values.clear();
+	const bool use_lawler_rule4 = lawler_rule4_position_filter_enabled(config_);
 
-	if (use_article_rule4
-		&& config_.use_lawler_position_filter
+	if (use_lawler_rule4
 		&& longest_pos_in_edd < static_cast<int>(edd_jobs.size())) {
+		// Rule 4 сравнивает значения T(π^(r)) для пробных EDD-последовательностей.
+		// Фильтр отключается флагом, поэтому его вклад можно сравнивать отдельно от базовой декомпозиции.
 		const int k = longest_pos_in_edd;
 		const int m = static_cast<int>(edd_jobs.size());
 		const int pivot_job = longest_job;
@@ -399,14 +639,14 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 				tardiness(completion, jj.d));
 		}
 
-		tni_values.resize(static_cast<std::size_t>(m - k));
-		tni_values[0] = total_tardiness_edd;
+		trial_tardiness_values.resize(static_cast<std::size_t>(m - k));
+		trial_tardiness_values[0] = total_tardiness_edd;
 		schedule_time_t start_t_before_pivot =
-			current_time + static_cast<schedule_time_t>(edd_prefix_processing[static_cast<std::size_t>(k)]);
+			current_time + static_cast<schedule_time_t>(edd_prefix_p[static_cast<std::size_t>(k)]);
 		for (int rel = 1; rel < m - k; ++rel) {
 			const int next_job = edd_jobs[static_cast<std::size_t>(k + rel)];
 			const job& nxt = jobs[static_cast<std::size_t>(next_job)];
-			long long t_next = tni_values[static_cast<std::size_t>(rel - 1)];
+			long long t_next = trial_tardiness_values[static_cast<std::size_t>(rel - 1)];
 			const schedule_time_t c_pivot_old = start_t_before_pivot + static_cast<schedule_time_t>(pivot.p);
 			const schedule_time_t c_next_old = c_pivot_old + static_cast<schedule_time_t>(nxt.p);
 			const schedule_time_t c_next_new = start_t_before_pivot + static_cast<schedule_time_t>(nxt.p);
@@ -419,7 +659,7 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 				tardiness(c_next_new, nxt.d));
 			t_next += static_cast<long long>(
 				tardiness(c_pivot_new, pivot.d));
-			tni_values[static_cast<std::size_t>(rel)] = t_next;
+			trial_tardiness_values[static_cast<std::size_t>(rel)] = t_next;
 			start_t_before_pivot += static_cast<schedule_time_t>(nxt.p);
 		}
 	}
@@ -427,104 +667,87 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 	const auto valid_positions_start = profiling_timers
 		? std::chrono::steady_clock::now()
 		: std::chrono::steady_clock::time_point{};
-	const bool use_position_filter = config_.use_lawler_position_filter;
-	const bool use_rule12 = config_.use_lawler_rule12;
-	const bool use_article_rule4_reductions = use_article_rule4 && !tni_values.empty();
-	if (!use_position_filter) {
+	const bool use_lawler_basic_rules = lawler_basic_position_filter_enabled(config_);
+	const bool use_rule4_reductions = use_lawler_rule4 && !trial_tardiness_values.empty();
+	std::uint64_t lawler_positions_before = 0;
+	// Position filtering уменьшает branching factor: вместо всех r >= q
+	// оставляем только позиции K(S), которые не запрещены правилами отсечения.
+	// lawler_r_positions хранит допустимые позиции r из K(S); h_idx = r - 1.
+	if (!use_lawler_basic_rules && !use_rule4_reductions) {
 		if (track_stats) {
-			stats_.valid_positions_built += static_cast<std::uint64_t>(
+			lawler_positions_before = static_cast<std::uint64_t>(
 				static_cast<int>(edd_jobs.size()) - longest_pos_in_edd);
+			stats_.valid_positions_built += lawler_positions_before;
 		}
 		for (int h_idx = longest_pos_in_edd; h_idx < static_cast<int>(edd_jobs.size()); ++h_idx) {
-			longest_positions.push_back(h_idx);
+			lawler_r_positions.push_back(h_idx);
 		}
 	}
-	else if (use_article_rule4_reductions) {
-		schedule_time_t article_rule3_max_dp = 0;
-		long long article_rule4_min_tni = std::numeric_limits<long long>::max();
+	else if (use_rule4_reductions) {
+		// Здесь применяется Rule 4 для позиций Lawler.
+		// Все оставленные позиции r затем ветвятся обычной Decomposition I, поэтому смысл OPT(S,t) не меняется.
+		schedule_time_t rule3_max_dp = 0;
+		long long rule4_min_trial_tardiness = std::numeric_limits<long long>::max();
 		for (int h_idx = longest_pos_in_edd; h_idx < static_cast<int>(edd_jobs.size()); ++h_idx) {
 			if (track_stats) {
 				++stats_.valid_positions_built;
+				++lawler_positions_before;
 			}
 
 			const schedule_time_t completion_at_h =
-				current_time + static_cast<schedule_time_t>(edd_prefix_processing[static_cast<std::size_t>(h_idx + 1)]);
+				current_time + static_cast<schedule_time_t>(edd_prefix_p[static_cast<std::size_t>(h_idx + 1)]);
 			bool eliminated = false;
-
-			if (use_rule12) {
-				if (h_idx + 1 < static_cast<int>(edd_jobs.size())) {
-					const int next_job = edd_jobs[static_cast<std::size_t>(h_idx + 1)];
-					if (completion_at_h > static_cast<schedule_time_t>(jobs[static_cast<std::size_t>(next_job)].d)) {
-						eliminated = true;
-					}
-				}
-				if (!eliminated && h_idx > longest_pos_in_edd) {
-					const job& curr = jobs[static_cast<std::size_t>(edd_jobs[static_cast<std::size_t>(h_idx)])];
-					if (completion_at_h <= static_cast<schedule_time_t>(curr.d) + static_cast<schedule_time_t>(curr.p)) {
-						eliminated = true;
-					}
-				}
-			}
 
 			const int rel = h_idx - longest_pos_in_edd;
 			if (h_idx >= longest_pos_in_edd + 2) {
 				const job& prev = jobs[static_cast<std::size_t>(edd_jobs[static_cast<std::size_t>(h_idx - 1)])];
 				const schedule_time_t rhs =
 					static_cast<schedule_time_t>(prev.d) + static_cast<schedule_time_t>(prev.p);
-				if (rhs > article_rule3_max_dp) {
-					article_rule3_max_dp = rhs;
+				if (rhs > rule3_max_dp) {
+					rule3_max_dp = rhs;
 				}
 			}
 			if (rel > 0) {
-				const long long prev_tni = tni_values[static_cast<std::size_t>(rel - 1)];
-				if (prev_tni < article_rule4_min_tni) {
-					article_rule4_min_tni = prev_tni;
+				const long long prev_trial_tardiness = trial_tardiness_values[static_cast<std::size_t>(rel - 1)];
+				if (prev_trial_tardiness < rule4_min_trial_tardiness) {
+					rule4_min_trial_tardiness = prev_trial_tardiness;
 				}
 			}
-			if (!eliminated && h_idx >= longest_pos_in_edd + 2 && completion_at_h <= article_rule3_max_dp) {
+			if (!eliminated && h_idx >= longest_pos_in_edd + 2 && completion_at_h <= rule3_max_dp) {
 				eliminated = true;
 			}
 			if (!eliminated) {
-				const long long t_curr = tni_values[static_cast<std::size_t>(rel)];
-				const bool dominated_by_prev = (rel > 0) && (t_curr >= article_rule4_min_tni);
+				const long long t_curr = trial_tardiness_values[static_cast<std::size_t>(rel)];
+				const bool dominated_by_prev = (rel > 0) && (t_curr >= rule4_min_trial_tardiness);
 				const bool dominated_by_next =
-					(rel + 1 < static_cast<int>(tni_values.size())) &&
-					(t_curr > tni_values[static_cast<std::size_t>(rel + 1)]);
+					(rel + 1 < static_cast<int>(trial_tardiness_values.size())) &&
+					(t_curr > trial_tardiness_values[static_cast<std::size_t>(rel + 1)]);
 				if (dominated_by_prev || dominated_by_next) {
 					eliminated = true;
 				}
 			}
 
 			if (!eliminated) {
-				longest_positions.push_back(h_idx);
+				lawler_r_positions.push_back(h_idx);
+			}
+			else if (track_stats) {
+				++stats_.positions_pruned_by_lawler_rule4;
 			}
 		}
 	}
 	else {
+		// Базовый позиционный фильтр для Lawler/Potts: Rule 1 и обобщённое Rule 3
+		// сокращают позиции r для центральной работы [q]_S.
 		schedule_time_t property3b_prefix_max = 0;
 		for (int h_idx = longest_pos_in_edd; h_idx < static_cast<int>(edd_jobs.size()); ++h_idx) {
 			if (track_stats) {
 				++stats_.valid_positions_built;
+				++lawler_positions_before;
 			}
 
 			const schedule_time_t completion_at_h =
-				current_time + static_cast<schedule_time_t>(edd_prefix_processing[static_cast<std::size_t>(h_idx + 1)]);
+				current_time + static_cast<schedule_time_t>(edd_prefix_p[static_cast<std::size_t>(h_idx + 1)]);
 			bool eliminated = false;
-
-			if (use_rule12) {
-				if (h_idx + 1 < static_cast<int>(edd_jobs.size())) {
-					const int next_job = edd_jobs[static_cast<std::size_t>(h_idx + 1)];
-					if (completion_at_h > static_cast<schedule_time_t>(jobs[static_cast<std::size_t>(next_job)].d)) {
-						eliminated = true;
-					}
-				}
-				if (!eliminated && h_idx > longest_pos_in_edd) {
-					const job& curr = jobs[static_cast<std::size_t>(edd_jobs[static_cast<std::size_t>(h_idx)])];
-					if (completion_at_h <= static_cast<schedule_time_t>(curr.d) + static_cast<schedule_time_t>(curr.p)) {
-						eliminated = true;
-					}
-				}
-			}
 
 			if (h_idx > longest_pos_in_edd) {
 				const job& r = jobs[static_cast<std::size_t>(edd_jobs[static_cast<std::size_t>(h_idx)])];
@@ -542,6 +765,7 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 					eliminated = true;
 					if (track_stats) {
 						++stats_.valid_positions_pruned_3a;
+						++stats_.positions_pruned_by_lawler_basic;
 					}
 				}
 			}
@@ -550,22 +774,36 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 				eliminated = true;
 				if (track_stats) {
 					++stats_.valid_positions_pruned_3b;
+					++stats_.positions_pruned_by_lawler_basic;
 				}
 			}
 
 			if (!eliminated) {
-				longest_positions.push_back(h_idx);
+				lawler_r_positions.push_back(h_idx);
 			}
 		}
 	}
 	if (profiling_timers) {
 		const auto valid_positions_finish = std::chrono::steady_clock::now();
-		stats_.valid_positions_time_ms +=
+		const double elapsed =
 			std::chrono::duration<double, std::milli>(valid_positions_finish - valid_positions_start).count();
+		stats_.valid_positions_time_ms += elapsed;
+		stats_.time_spent_in_position_filtering_ms += elapsed;
 	}
-	if (longest_positions.empty()) {
-		// Keep exactness: never allow an empty candidate set.
-		longest_positions.push_back(longest_pos_in_edd);
+	if (lawler_r_positions.empty()) {
+		// Для точности нельзя оставлять K(S) пустым: хотя бы исходная позиция q допустима.
+		lawler_r_positions.push_back(longest_pos_in_edd);
+	}
+	if (track_stats) {
+		const std::uint64_t lawler_positions_after =
+			static_cast<std::uint64_t>(lawler_r_positions.size());
+		stats_.valid_positions_before += lawler_positions_before;
+		stats_.valid_positions_after += lawler_positions_after;
+		stats_.candidate_positions_before += lawler_positions_before;
+		stats_.candidate_positions_after += lawler_positions_after;
+		if (lawler_positions_before > lawler_positions_after) {
+			stats_.positions_pruned += lawler_positions_before - lawler_positions_after;
+		}
 	}
 
 	const std::vector<std::uint64_t>& saved_bits = runtime_.remaining_bits;
@@ -579,6 +817,8 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 		std::uint64_t subset_fingerprint,
 		schedule_time_t start_time,
 		bool count_stats) {
+			// На время lookup делаем переданный subset текущим состоянием solver.
+			// Инвариант memo сохраняется: запрос всегда проверяет полный ключ (S,t).
 			const std::uint64_t prev_hash = runtime_.subset_hash;
 			const std::uint64_t prev_fp = runtime_.subset_fingerprint;
 			const int prev_count = runtime_.remaining_count;
@@ -606,12 +846,17 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 			const memo_lookup_result memo_lb =
 				lookup_subset_bits(bits, subset_count, subset_hash, subset_fingerprint, start_time, false);
 			if (memo_lb.found && memo_lb.has_exact) {
+				if (track_stats) {
+					++stats_.memo_exact_hits;
+				}
 				return memo_lb.exact;
 			}
-			if (!config_.use_lower_bounds) {
+			if (!any_lb_enabled(config_)) {
 				return 0;
 			}
 
+			// LB для дочернего подмножества считается в том же формате OPT(S',t'),
+			// но используется только как допустимая оценка, не как ответ.
 			const std::uint64_t prev_hash = runtime_.subset_hash;
 			const std::uint64_t prev_fp = runtime_.subset_fingerprint;
 			const int prev_count = runtime_.remaining_count;
@@ -619,9 +864,15 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 			runtime_.subset_hash = subset_hash;
 			runtime_.subset_fingerprint = subset_fingerprint;
 			runtime_.remaining_count = subset_count;
+			if (track_stats) {
+				++stats_.simple_lb_calls;
+			}
 			long long lb = lower_bound_additional(n_ - subset_count, start_time);
 			if (memo_lb.found && memo_lb.lower_bound > lb) {
 				lb = memo_lb.lower_bound;
+				if (track_stats) {
+					++stats_.memo_lb_hits;
+				}
 			}
 			store_lower_bound_memo(start_time, lb, false);
 			runtime_.remaining_bits.swap(bits);
@@ -650,9 +901,14 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 				if (out_first_job != nullptr) {
 					*out_first_job = lk.best_job;
 				}
+				if (track_stats) {
+					++stats_.memo_exact_hits;
+				}
 				return lk.exact;
 			}
 
+			// Если exact-записи нет, рекурсивно решаем подзадачу (S',t').
+			// known_lookup может содержать LB-запись, но она не заменяет exact OPT.
 			const std::uint64_t prev_hash = runtime_.subset_hash;
 			const std::uint64_t prev_fp = runtime_.subset_fingerprint;
 			const int prev_count = runtime_.remaining_count;
@@ -692,95 +948,85 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 			return exact;
 		};
 
+	// Одна ветвь: before, pivot, after соответствует L_r,[q]_S,R_r
+	// для Lawler или аналогичному разрезу A,[1]_S,rest для Szwarc.
+	// pivot_completion — это C_pivot; вклад pivot равен T_pivot.
+	// fallback_first_in_before нужен только для best_job, если child memo ещё не вернул первую работу блока.
 	auto evaluate_branch_bits = [&](int pivot_job,
-		std::vector<std::uint64_t>& b_bits, int b_count, std::uint64_t b_hash, std::uint64_t b_fp,
-		std::vector<std::uint64_t>& a_bits, int a_count, std::uint64_t a_hash, std::uint64_t a_fp,
-		schedule_time_t pivot_completion, int fallback_first_in_b) {
-			const long long pivot_cost = static_cast<long long>(
+		std::vector<std::uint64_t>& before_bits, int before_count, std::uint64_t before_hash, std::uint64_t before_fp,
+		std::vector<std::uint64_t>& after_bits, int after_count, std::uint64_t after_hash, std::uint64_t after_fp,
+		schedule_time_t pivot_completion, int fallback_first_in_before) {
+			if (track_stats) {
+				++stats_.branches_generated;
+			}
+			const long long pivot_tardiness_T = static_cast<long long>(
 				tardiness(pivot_completion,
 					inst_->jobs[static_cast<std::size_t>(pivot_job)].d));
 
-			long long lb_b = 0;
-			long long lb_a = 0;
-			if (config_.use_lower_bounds) {
-				lb_b = subset_lower_bound_bits(b_bits, b_count, b_hash, b_fp, current_time);
-				lb_a = subset_lower_bound_bits(a_bits, a_count, a_hash, a_fp, pivot_completion);
-				if (lb_b + pivot_cost + lb_a >= best_additional) {
+			long long LB_before = 0;
+			long long LB_after = 0;
+			if (any_lb_enabled(config_)) {
+				LB_before = subset_lower_bound_bits(before_bits, before_count, before_hash, before_fp, current_time);
+				LB_after = subset_lower_bound_bits(after_bits, after_count, after_hash, after_fp, pivot_completion);
+				if (LB_before + pivot_tardiness_T + LB_after >= upper_bound_UB) {
 					if (track_stats) {
 						++stats_.pruned_by_bound;
+						++stats_.branches_pruned;
+						++stats_.lb_prunes;
+						if (config_.bounds.enable_simple_lb) {
+							++stats_.simple_lb_prunes;
+						}
 					}
 					return;
 				}
 			}
 
-			int first_in_b = -1;
-			const long long cost_b =
-				solve_subset_exact_bits(b_bits, b_count, b_hash, b_fp, current_time, &first_in_b);
-			if (config_.use_lower_bounds && cost_b + pivot_cost + lb_a >= best_additional) {
+			int first_in_before = -1;
+			const long long OPT_before =
+				solve_subset_exact_bits(before_bits, before_count, before_hash, before_fp, current_time, &first_in_before);
+			if (use_upper_bound_here && OPT_before + pivot_tardiness_T + LB_after >= upper_bound_UB) {
 				if (track_stats) {
 					++stats_.pruned_by_bound;
+					++stats_.branches_pruned;
+					if (any_lb_enabled(config_)) {
+						++stats_.lb_prunes;
+						if (config_.bounds.enable_simple_lb) {
+							++stats_.simple_lb_prunes;
+						}
+					}
+					else {
+						++stats_.ub_prunes;
+					}
 				}
 				return;
 			}
 
-			const long long cost_a =
-				solve_subset_exact_bits(a_bits, a_count, a_hash, a_fp, pivot_completion, nullptr);
-			const long long total = cost_b + pivot_cost + cost_a;
-			if (total < best_additional) {
-				best_additional = total;
-				if (b_count == 0) {
+			const long long OPT_after =
+				solve_subset_exact_bits(after_bits, after_count, after_hash, after_fp, pivot_completion, nullptr);
+			const long long total = OPT_before + pivot_tardiness_T + OPT_after;
+			if (total < upper_bound_UB) {
+				upper_bound_UB = total;
+				if (track_stats) {
+					++stats_.ub_improvements;
+				}
+				if (before_count == 0) {
 					best_first_job = pivot_job;
 				}
-				else if (first_in_b >= 0) {
-					best_first_job = first_in_b;
+				else if (first_in_before >= 0) {
+					best_first_job = first_in_before;
 				}
 				else {
-					best_first_job = fallback_first_in_b;
+					best_first_job = fallback_first_in_before;
 				}
 			}
 		};
 
 	const int max_earliest_pos = static_cast<int>(edd_jobs.size()) - earliest_pos_in_lpt - 1;
-	const bool szwarc_available = config_.use_decomposition2
-		&& earliest_job != longest_job
+	// Szwarc / Decomposition II применим, когда центральная работа [1]_S
+	// отличается от Lawler-работы l. LPT задаёт, какие работы могут оказаться
+	// перед [1]_S в разрезе Decomposition II.
+	const bool szwarc_available = earliest_job != longest_job
 		&& max_earliest_pos >= 0;
-
-	bool run_double = false;
-	bool run_lawler = false;
-	bool run_szwarc = false;
-	switch (config_.decomp_policy) {
-	case decomposition_policy::lawler:
-		run_lawler = true;
-		break;
-	case decomposition_policy::szwarc:
-		run_szwarc = szwarc_available;
-		break;
-	case decomposition_policy::both:
-		run_double = szwarc_available;
-		if (!run_double) {
-			run_lawler = true;
-		}
-		break;
-	case decomposition_policy::adaptive:
-	default:
-		if (!szwarc_available) {
-			run_lawler = true;
-		}
-		else {
-			const int lawler_count = static_cast<int>(longest_positions.size());
-			const int szwarc_count = max_earliest_pos + 1;
-			if (lawler_count <= szwarc_count) {
-				run_lawler = true;
-			}
-			else {
-				run_szwarc = true;
-			}
-		}
-		break;
-	}
-	if (!run_double && !run_lawler && !run_szwarc) {
-		run_lawler = true;
-	}
 
 	auto edd_less = [&](int lhs_job, int rhs_job) {
 		const job& lhs = inst_->jobs[static_cast<std::size_t>(lhs_job)];
@@ -794,7 +1040,40 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 		return lhs_job < rhs_job;
 		};
 
-		auto prepare_szwarc_positions = [&](std::vector<int>& out_positions) {
+		auto prepare_szwarc_positions = [&](std::vector<int>& out_positions, bool count_position_stats) {
+			const auto szwarc_positions_start = (count_position_stats && profiling_timers)
+				? std::chrono::steady_clock::now()
+				: std::chrono::steady_clock::time_point{};
+			const auto finish_szwarc_position_timer = [&]() {
+				if (!count_position_stats || !profiling_timers) {
+					return;
+				}
+				const auto finish = std::chrono::steady_clock::now();
+				const double elapsed =
+					std::chrono::duration<double, std::milli>(finish - szwarc_positions_start).count();
+				stats_.valid_positions_time_ms += elapsed;
+				stats_.time_spent_in_position_filtering_ms += elapsed;
+				};
+			const auto add_szwarc_position_stats =
+				[&](std::uint64_t positions_before, std::uint64_t positions_after) {
+					if (!count_position_stats) {
+						return;
+					}
+					stats_.valid_positions_before += positions_before;
+					stats_.valid_positions_after += positions_after;
+					stats_.candidate_positions_before += positions_before;
+					stats_.candidate_positions_after += positions_after;
+					if (positions_before > positions_after) {
+						const std::uint64_t pruned = positions_before - positions_after;
+						stats_.positions_pruned += pruned;
+						if (szwarc_rule4_position_filter_enabled(config_)) {
+							stats_.positions_pruned_by_szwarc_rule4 += pruned;
+						}
+					}
+				};
+			// Decomposition II двигает работу [1]_S (минимальный d_j) относительно
+			// работ, которые идут после неё в LPT(S). Поэтому сначала берём LPT-хвост,
+			// а затем восстанавливаем для него EDD-порядок левого блока A.
 			std::vector<std::uint32_t>& candidate_marks = scratch.candidate_marks;
 			std::uint32_t mark = scratch.candidate_mark_epoch + 1;
 			if (mark == 0) {
@@ -813,7 +1092,7 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 					candidates_before_earliest.push_back(j);
 				}
 			}
-			if (track_stats) {
+			if (count_position_stats) {
 				++stats_.ordering_scans;
 			}
 
@@ -828,17 +1107,23 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 			}
 
 			out_positions.clear();
-			if (!config_.use_lawler_position_filter || !use_article_rule4) {
+			if (!szwarc_rule4_position_filter_enabled(config_)) {
+				// Без position filtering перебираем все размеры A: от пустого блока
+				// до максимального числа кандидатов перед [1]_S.
 				for (int r = 0; r <= max_earliest_pos; ++r) {
 					out_positions.push_back(r);
 				}
+				add_szwarc_position_stats(static_cast<std::uint64_t>(max_earliest_pos + 1),
+					static_cast<std::uint64_t>(out_positions.size()));
+				finish_szwarc_position_timer();
 				return;
 			}
-			
 
 			const job& earliest = inst_->jobs[static_cast<std::size_t>(earliest_job)];
-		std::vector<long long>& local_tni = scratch.tni_values;
-		local_tni.resize(candidates_before_earliest.size() + 1);
+			// Rule 4 для Szwarc сравнивает значения T(π^(r)) при переносе
+			// работы [1]_S относительно кандидатов перед ней.
+			std::vector<long long>& trial_tardiness = scratch.trial_tardiness_values;
+			trial_tardiness.resize(candidates_before_earliest.size() + 1);
 
 		long long t_cur = 0;
 		schedule_time_t c = current_time;
@@ -849,13 +1134,13 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 			c += static_cast<schedule_time_t>(jj.p);
 			t_cur += static_cast<long long>(tardiness(c, jj.d));
 		}
-		local_tni[0] = t_cur;
+		trial_tardiness[0] = t_cur;
 
 		schedule_time_t start_t_before_pivot = current_time;
 		for (int rel = 1; rel <= static_cast<int>(candidates_before_earliest.size()); ++rel) {
 			const int next_job = candidates_before_earliest[static_cast<std::size_t>(rel - 1)];
 			const job& nxt = inst_->jobs[static_cast<std::size_t>(next_job)];
-			long long t_next = local_tni[static_cast<std::size_t>(rel - 1)];
+			long long t_next = trial_tardiness[static_cast<std::size_t>(rel - 1)];
 			const schedule_time_t c_pivot_old = start_t_before_pivot + static_cast<schedule_time_t>(earliest.p);
 			const schedule_time_t c_next_old = c_pivot_old + static_cast<schedule_time_t>(nxt.p);
 			const schedule_time_t c_next_new = start_t_before_pivot + static_cast<schedule_time_t>(nxt.p);
@@ -868,23 +1153,23 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 				tardiness(c_next_new, nxt.d));
 			t_next += static_cast<long long>(
 				tardiness(c_pivot_new, earliest.d));
-			local_tni[static_cast<std::size_t>(rel)] = t_next;
+			trial_tardiness[static_cast<std::size_t>(rel)] = t_next;
 			start_t_before_pivot += static_cast<schedule_time_t>(nxt.p);
 		}
 
-		long long min_tni = std::numeric_limits<long long>::max();
+		long long min_trial_tardiness = std::numeric_limits<long long>::max();
 		for (int r = 0; r <= max_earliest_pos; ++r) {
 			if (r >= 1) {
-				const long long prev = local_tni[static_cast<std::size_t>(r - 1)];
-				if (prev < min_tni) {
-					min_tni = prev;
+				const long long prev = trial_tardiness[static_cast<std::size_t>(r - 1)];
+				if (prev < min_trial_tardiness) {
+					min_trial_tardiness = prev;
 				}
 			}
-			const long long t_r = local_tni[static_cast<std::size_t>(r)];
-			const bool dominated_by_prev = (r >= 1) && (t_r >= min_tni);
+			const long long t_r = trial_tardiness[static_cast<std::size_t>(r)];
+			const bool dominated_by_prev = (r >= 1) && (t_r >= min_trial_tardiness);
 			const bool dominated_by_next =
 				(r < max_earliest_pos) &&
-				(t_r > local_tni[static_cast<std::size_t>(r + 1)]);
+				(t_r > trial_tardiness[static_cast<std::size_t>(r + 1)]);
 			if (!dominated_by_prev && !dominated_by_next) {
 				out_positions.push_back(r);
 			}
@@ -892,11 +1177,283 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 		if (out_positions.empty()) {
 			out_positions.push_back(0);
 		}
-		};
+		add_szwarc_position_stats(static_cast<std::uint64_t>(max_earliest_pos + 1),
+			static_cast<std::uint64_t>(out_positions.size()));
+		finish_szwarc_position_timer();
+	};
+
+	enum class adaptive_choice {
+		lawler,
+		szwarc,
+		both
+	};
+
+	auto choose_v1 = [&]() {
+		const int lawler_count = static_cast<int>(lawler_r_positions.size());
+		const int szwarc_count = max_earliest_pos + 1;
+		return (szwarc_available && szwarc_count < lawler_count)
+			? adaptive_choice::szwarc
+			: adaptive_choice::lawler;
+	};
+
+	auto estimate_szwarc_positions = [&]() -> int {
+		if (!szwarc_available) {
+			return std::numeric_limits<int>::max() / 4;
+		}
+		std::vector<int>& estimated_positions = scratch.szwarc_positions;
+		prepare_szwarc_positions(estimated_positions, false);
+		return std::max(1, static_cast<int>(estimated_positions.size()));
+	};
+
+	auto average_lawler_position_cost = [&]() -> double {
+		if (lawler_r_positions.empty()) {
+			return 0.0;
+		}
+		long long total = 0;
+		for (int h_idx : lawler_r_positions) {
+			const int before_count = h_idx;
+			const int after_count = saved_count - before_count - 1;
+			total += std::max(before_count, after_count);
+		}
+		return static_cast<double>(total) / static_cast<double>(lawler_r_positions.size());
+	};
+
+	auto average_szwarc_position_cost = [&]() -> double {
+		if (!szwarc_available) {
+			return static_cast<double>(saved_count);
+		}
+		std::vector<int>& estimated_positions = scratch.szwarc_positions;
+		if (estimated_positions.empty()) {
+			prepare_szwarc_positions(estimated_positions, false);
+		}
+		long long total = 0;
+		for (int b_size : estimated_positions) {
+			const int after_count = saved_count - b_size - 1;
+			total += std::max(b_size, after_count);
+		}
+		return static_cast<double>(total) / static_cast<double>(estimated_positions.size());
+	};
+
+	auto estimate_double_children_count = [&]() -> int {
+		if (!szwarc_available) {
+			return std::numeric_limits<int>::max() / 4;
+		}
+		std::vector<int>& estimated_positions = scratch.szwarc_positions;
+		if (estimated_positions.empty()) {
+			prepare_szwarc_positions(estimated_positions, false);
+		}
+		int pair_count = 0;
+		for (int h_idx : lawler_r_positions) {
+			const int lawler_prefix_count = h_idx;
+			for (int b_size : estimated_positions) {
+				if (b_size > static_cast<int>(scratch.candidates_before_earliest.size())) {
+					break;
+				}
+				if (b_size > lawler_prefix_count - 1) {
+					continue;
+				}
+				if (h_idx < static_cast<int>(edd_jobs.size()) - 1 && b_size > 0) {
+					const int left_last = scratch.candidates_before_earliest[static_cast<std::size_t>(b_size - 1)];
+					const int right_first = edd_jobs[static_cast<std::size_t>(h_idx + 1)];
+					if (!edd_less(left_last, right_first)) {
+						break;
+					}
+				}
+				++pair_count;
+			}
+		}
+		return pair_count > 0 ? pair_count : std::numeric_limits<int>::max() / 4;
+	};
+
+	auto min_count_choice = [](int lawler_count, int szwarc_count, int both_count) {
+		adaptive_choice best = adaptive_choice::lawler;
+		int best_count = lawler_count;
+		if (szwarc_count < best_count) {
+			best = adaptive_choice::szwarc;
+			best_count = szwarc_count;
+		}
+		if (both_count < best_count) {
+			best = adaptive_choice::both;
+		}
+		return best;
+	};
+
+	auto choose_v2 = [&]() {
+		if (!szwarc_available) {
+			return adaptive_choice::lawler;
+		}
+		const int lawler_count = static_cast<int>(lawler_r_positions.size());
+		const int szwarc_count = estimate_szwarc_positions();
+		const int both_count = estimate_double_children_count();
+		const bool tiny_state = saved_count <= 12;
+		if (tiny_state) {
+			return min_count_choice(lawler_count, szwarc_count, both_count);
+		}
+		constexpr int decisive_ratio = 2;
+		if (lawler_count * decisive_ratio <= szwarc_count &&
+			lawler_count * decisive_ratio <= both_count) {
+			return adaptive_choice::lawler;
+		}
+		if (szwarc_count * decisive_ratio <= lawler_count &&
+			szwarc_count * decisive_ratio <= both_count) {
+			return adaptive_choice::szwarc;
+		}
+		if (both_count * decisive_ratio <= lawler_count &&
+			both_count * decisive_ratio <= szwarc_count) {
+			return adaptive_choice::both;
+		}
+		return choose_v1();
+	};
+
+	auto choose_v3 = [&]() {
+		if (!szwarc_available) {
+			return adaptive_choice::lawler;
+		}
+		constexpr double alpha = 0.05;
+		const int lawler_count = static_cast<int>(lawler_r_positions.size());
+		const int szwarc_count = estimate_szwarc_positions();
+		const int both_count = estimate_double_children_count();
+		const double lawler_score =
+			static_cast<double>(lawler_count) + alpha * average_lawler_position_cost();
+		const double szwarc_score =
+			static_cast<double>(szwarc_count) + alpha * average_szwarc_position_cost();
+		const double both_score =
+			static_cast<double>(both_count) + alpha * static_cast<double>(saved_count);
+		if (both_score < lawler_score && both_score < szwarc_score) {
+			return adaptive_choice::both;
+		}
+		return (szwarc_score < lawler_score) ? adaptive_choice::szwarc : adaptive_choice::lawler;
+	};
+
+	bool run_double = false;
+	bool run_lawler = false;
+	bool run_szwarc = false;
+	bool used_adaptive_selection = false;
+	adaptive_choice selected_adaptive_choice = adaptive_choice::lawler;
+
+	auto choose_adaptive_flags = [&]() {
+		used_adaptive_selection = true;
+		// Adaptive v1/v2/v3 меняют только порядок выбора точной декомпозиции.
+		// Ни один вариант не добавляет pruning и не исключает ветви выбранного разложения,
+		// поэтому значение OPT(S,t) остаётся тем же.
+		switch (config_.adaptive_policy) {
+		case adaptive_policy_kind::v2:
+			selected_adaptive_choice = choose_v2();
+			break;
+		case adaptive_policy_kind::v3:
+			selected_adaptive_choice = choose_v3();
+			break;
+		case adaptive_policy_kind::v1:
+		default:
+			selected_adaptive_choice = choose_v1();
+			break;
+		}
+		if (selected_adaptive_choice == adaptive_choice::both) {
+			run_double = szwarc_available;
+		}
+		else if (selected_adaptive_choice == adaptive_choice::szwarc) {
+			run_szwarc = szwarc_available;
+		}
+		else {
+			run_lawler = true;
+		}
+	};
+
+	switch (config_.decomposition_mode) {
+	case DecompositionMode::Lawler:
+		run_lawler = true;
+		break;
+	case DecompositionMode::Szwarc:
+		run_szwarc = szwarc_available;
+		break;
+	case DecompositionMode::BothLawlerSzwarc:
+		run_double = szwarc_available;
+		if (!run_double) {
+			run_lawler = true;
+		}
+		break;
+	case DecompositionMode::Adaptive:
+	default:
+		choose_adaptive_flags();
+		break;
+	}
+	if (!run_double && !run_lawler && !run_szwarc) {
+		// Например, явно выбранный Szwarc может быть недоступен в данном S.
+		// Переход к Lawler сохраняет точность: Decomposition I доступна всегда.
+		run_lawler = true;
+		selected_adaptive_choice = adaptive_choice::lawler;
+	}
+	int estimated_branches_here = 0;
+	if (run_double) {
+		estimated_branches_here += estimate_double_children_count();
+	}
+	if (run_lawler) {
+		estimated_branches_here += static_cast<int>(lawler_r_positions.size());
+	}
+	if (run_szwarc) {
+		estimated_branches_here += estimate_szwarc_positions();
+	}
+	if (depth >= 0 && depth < static_cast<int>(runtime_.estimated_branches_by_depth.size())) {
+		runtime_.estimated_branches_by_depth[static_cast<std::size_t>(depth)] = estimated_branches_here;
+	}
+	if (track_stats && used_adaptive_selection) {
+		std::uint64_t* generic_counter = nullptr;
+		std::uint64_t* version_counter = nullptr;
+		if (run_double) {
+			generic_counter = &stats_.adaptive_choices_both;
+			if (config_.adaptive_policy == adaptive_policy_kind::v2) {
+				version_counter = &stats_.adaptive_v2_choices_both;
+			}
+			else if (config_.adaptive_policy == adaptive_policy_kind::v3) {
+				version_counter = &stats_.adaptive_v3_choices_both;
+			}
+			else {
+				version_counter = &stats_.adaptive_v1_choices_both;
+			}
+		}
+		else if (run_szwarc && !run_lawler) {
+			generic_counter = &stats_.adaptive_choices_szwarc;
+			++stats_.adaptive_choice_szwarc;
+			if (config_.adaptive_policy == adaptive_policy_kind::v2) {
+				version_counter = &stats_.adaptive_v2_choices_szwarc;
+			}
+			else if (config_.adaptive_policy == adaptive_policy_kind::v3) {
+				version_counter = &stats_.adaptive_v3_choices_szwarc;
+			}
+			else {
+				version_counter = &stats_.adaptive_v1_choices_szwarc;
+			}
+		}
+		else if (run_lawler && !run_szwarc) {
+			generic_counter = &stats_.adaptive_choices_lawler;
+			++stats_.adaptive_choice_lawler;
+			if (config_.adaptive_policy == adaptive_policy_kind::v2) {
+				version_counter = &stats_.adaptive_v2_choices_lawler;
+			}
+			else if (config_.adaptive_policy == adaptive_policy_kind::v3) {
+				version_counter = &stats_.adaptive_v3_choices_lawler;
+			}
+			else {
+				version_counter = &stats_.adaptive_v1_choices_lawler;
+			}
+		}
+		if (generic_counter != nullptr) {
+			++(*generic_counter);
+		}
+		if (version_counter != nullptr) {
+			++(*version_counter);
+		}
+	}
 
 	if (run_double) {
+		if (track_stats) {
+			++stats_.both_nodes;
+		}
+		// Double Decomposition: совместно фиксируем позиции [1]_S и l=[q]_S.
+		// Реализован порядок блоков A,[1]_S,B,l,C, то есть это не простой
+		// последовательный запуск Lawler и Szwarc, а парное разбиение одной подзадачи.
 		std::vector<int>& szwarc_positions = scratch.szwarc_positions;
-		prepare_szwarc_positions(szwarc_positions);
+		prepare_szwarc_positions(szwarc_positions, track_stats);
 
 		std::vector<std::uint64_t>& lawler_prefix_bits = scratch.prefix_bits;
 		std::vector<std::uint64_t>& mid_bits = scratch.b_bits;
@@ -924,7 +1481,7 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 		std::uint64_t lawler_prefix_fp = 0;
 		bool evaluated_pair = false;
 
-		for (int h_idx : longest_positions) {
+		for (int h_idx : lawler_r_positions) {
 			while (lawler_prefix_scan <= h_idx) {
 				const int j = edd_jobs[static_cast<std::size_t>(lawler_prefix_scan)];
 				if (j != longest_job) {
@@ -949,19 +1506,9 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 
 			const schedule_time_t longest_completion =
 				current_time +
-				static_cast<schedule_time_t>(edd_prefix_processing[static_cast<std::size_t>(h_idx + 1)]);
+				static_cast<schedule_time_t>(edd_prefix_p[static_cast<std::size_t>(h_idx + 1)]);
 			const long long longest_cost = static_cast<long long>(
 				tardiness(longest_completion, longest.d));
-			if (config_.use_lower_bounds && config_.use_double_pair_lb_prune) {
-				const long long right_lb = subset_lower_bound_bits(
-					right_bits, right_count, right_hash, right_fp, longest_completion);
-				if (longest_cost + right_lb >= best_additional) {
-					if (track_stats) {
-						++stats_.pruned_by_bound;
-					}
-					continue;
-				}
-			}
 			const long long right_cost = solve_subset_exact_bits(
 				right_bits, right_count, right_hash, right_fp, longest_completion, nullptr);
 
@@ -1021,41 +1568,24 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 					tardiness(earliest_completion, earliest.d));
 
 				evaluated_pair = true;
-
-				if (config_.use_lower_bounds && config_.use_double_pair_lb_prune) {
-					const long long left_lb = subset_lower_bound_bits(
-						left_bits, b_size, left_hash, left_fp, current_time);
-					const long long mid_lb = subset_lower_bound_bits(
-						mid_bits, mid_count, mid_hash, mid_fp, earliest_completion);
-					if (left_lb + earliest_cost + mid_lb + longest_cost + right_cost >= best_additional) {
-						if (track_stats) {
-							++stats_.pruned_by_bound;
-						}
-						continue;
-					}
+				if (track_stats) {
+					++stats_.branches_generated;
 				}
 
 				int first_in_left = -1;
 				const long long left_cost = solve_subset_exact_bits(
 					left_bits, b_size, left_hash, left_fp, current_time, &first_in_left);
-				if (config_.use_lower_bounds && config_.use_double_pair_lb_prune) {
-					const long long mid_lb = subset_lower_bound_bits(
-						mid_bits, mid_count, mid_hash, mid_fp, earliest_completion);
-					if (left_cost + earliest_cost + mid_lb + longest_cost + right_cost >= best_additional) {
-						if (track_stats) {
-							++stats_.pruned_by_bound;
-						}
-						continue;
-					}
-				}
 
 				const long long mid_cost = solve_subset_exact_bits(
 					mid_bits, mid_count, mid_hash, mid_fp, earliest_completion, nullptr);
 
 				const long long total =
 					left_cost + earliest_cost + mid_cost + longest_cost + right_cost;
-				if (total < best_additional) {
-					best_additional = total;
+				if (total < upper_bound_UB) {
+					upper_bound_UB = total;
+					if (track_stats) {
+						++stats_.ub_improvements;
+					}
 					if (b_size == 0) {
 						best_first_job = earliest_job;
 					}
@@ -1066,11 +1596,11 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 						best_first_job = left_fallback_first;
 					}
 				}
-				if (best_additional == 0) {
+				if (upper_bound_UB == 0) {
 					break;
 				}
 			}
-			if (best_additional == 0) {
+			if (upper_bound_UB == 0) {
 				break;
 			}
 		}
@@ -1082,7 +1612,12 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 	}
 
 	if (run_lawler) {
-		// Decomposition 1 (Lawler): branch longest job on h >= k.
+		if (track_stats) {
+			++stats_.lawler_nodes;
+		}
+		// Decomposition I (Lawler): центральная работа [q]_S имеет максимальное p_j.
+		// "Вставить [q]_S в позицию r" означает выбрать EDD-префикс L_r перед ней;
+		// остальные работы образуют правый блок R_r. Ветвь имеет вид L_r, [q]_S, R_r.
 		std::vector<std::uint64_t>& prefix_bits = scratch.prefix_bits;
 		std::vector<std::uint64_t>& b_bits = scratch.b_bits;
 		std::vector<std::uint64_t>& a_bits = scratch.a_bits;
@@ -1101,7 +1636,7 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 		std::uint64_t prefix_hash = 0;
 		std::uint64_t prefix_fp = 0;
 
-		for (int h_idx : longest_positions) {
+		for (int h_idx : lawler_r_positions) {
 			while (prefix_scan <= h_idx) {
 				const int j = edd_jobs[static_cast<std::size_t>(prefix_scan)];
 				if (j != longest_job) {
@@ -1130,7 +1665,8 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 			const std::uint64_t a_fp = saved_fp ^ prefix_fp ^ pivot_fp;
 
 			const schedule_time_t pivot_completion =
-				current_time + static_cast<schedule_time_t>(edd_prefix_processing[static_cast<std::size_t>(h_idx + 1)]);
+				current_time + static_cast<schedule_time_t>(edd_prefix_p[static_cast<std::size_t>(h_idx + 1)]);
+			// C_[q](r,t) = t + p(L_r) + p_[q].
 			evaluate_branch_bits(
 				longest_job,
 				b_bits, prefix_count, prefix_hash, prefix_fp,
@@ -1141,9 +1677,14 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 	}
 
 	if (run_szwarc) {
-		// Decomposition 2 (Szwarc): branch earliest due-date job.
+		if (track_stats) {
+			++stats_.szwarc_nodes;
+		}
+		// Decomposition II (Szwarc): центральная работа [1]_S имеет минимальный d_j.
+		// LPT используется, чтобы определить кандидатов, которые могут стоять перед ней;
+		// b_size задаёт левый блок A, а остальные работы образуют правый блок.
 		std::vector<int>& szwarc_positions = scratch.szwarc_positions;
-		prepare_szwarc_positions(szwarc_positions);
+		prepare_szwarc_positions(szwarc_positions, track_stats);
 
 		std::vector<int>& candidates_before_earliest = scratch.candidates_before_earliest;
 		std::vector<long long>& before_prefix = scratch.before_prefix;
@@ -1197,6 +1738,7 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 				current_time +
 				static_cast<schedule_time_t>(before_prefix[static_cast<std::size_t>(b_size)]) +
 				static_cast<schedule_time_t>(inst_->jobs[static_cast<std::size_t>(earliest_job)].p);
+			// C_[1](r,t) = t + p(A) + p_[1] для выбранного левого блока A.
 			evaluate_branch_bits(
 				earliest_job,
 				b_bits, b_size, prefix_hash, prefix_fp,
@@ -1207,12 +1749,87 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 	}
 
 	runtime_.perm_jobs[static_cast<std::size_t>(depth)] = best_first_job;
-	store_exact_memo(current_time, best_additional, best_first_job, track_stats);
-	return best_additional;
+	// После полного решения подзадачи сохраняем M[(S,t)] = OPT(S,t).
+	store_exact_memo(current_time, upper_bound_UB, best_first_job, track_stats);
+	return upper_bound_UB;
+}
+
+bool dfs_solver::try_terminal_rules(int, schedule_time_t current_time,
+	const std::vector<int>& edd_jobs,
+	const std::vector<int>& lpt_jobs,
+	long long& exact,
+	int& first_job,
+	std::uint64_t*& hit_counter) {
+	// Terminal rules — точные частные случаи. Они сразу дают OPT(S,t),
+	// поэтому результат можно сохранять как exact memo entry.
+	if (edd_jobs.empty()) {
+		exact = 0;
+		first_job = -1;
+		hit_counter = &stats_.terminal_edd_one_tardy_hits;
+		return true;
+	}
+
+	if (config_.terminal_rules.enable_edd_at_most_one_tardy) {
+		long long edd_cost = 0;
+		int edd_tardy_count = 0;
+		schedule_time_t edd_time = current_time;
+		for (int job_idx : edd_jobs) {
+			const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
+			edd_time += static_cast<schedule_time_t>(j.p);
+			const schedule_cost_t tardy = tardiness(edd_time, j.d);
+			if (tardy > 0) {
+				++edd_tardy_count;
+			}
+			edd_cost += static_cast<long long>(tardy);
+		}
+		if (edd_tardy_count <= 1) {
+			// Если в EDD не больше одной запаздывающей работы, EDD уже оптимален.
+			exact = edd_cost;
+			first_job = edd_jobs.front();
+			hit_counter = &stats_.terminal_edd_one_tardy_hits;
+			return true;
+		}
+	}
+
+	if (!config_.terminal_rules.enable_all_tardy_spt) {
+		return false;
+	}
+
+	bool all_tardy_even_first = true;
+	for (int job_idx : edd_jobs) {
+		const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
+		if (current_time + static_cast<schedule_time_t>(j.p) <= static_cast<schedule_time_t>(j.d)) {
+			all_tardy_even_first = false;
+			break;
+		}
+	}
+	if (!all_tardy_even_first) {
+		return false;
+	}
+
+	// Если любая оставшаяся работа запаздывает даже первой, минимизация ΣC_j
+	// эквивалентна минимизации ΣT_j; тогда оптимален SPT. Получаем SPT как reverse LPT.
+	long long spt_cost = 0;
+	schedule_time_t spt_time = current_time;
+	first_job = -1;
+	for (auto it = lpt_jobs.rbegin(); it != lpt_jobs.rend(); ++it) {
+		const int job_idx = *it;
+		if (first_job < 0) {
+			first_job = job_idx;
+		}
+		const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
+		spt_time += static_cast<schedule_time_t>(j.p);
+		spt_cost += static_cast<long long>(tardiness(spt_time, j.d));
+	}
+	exact = spt_cost;
+	hit_counter = &stats_.terminal_all_tardy_spt_hits;
+	return true;
 }
 
 long long dfs_solver::lower_bound_additional(int depth, schedule_time_t current_time) const {
 	(void)depth;
+	// Простая admissible LB: каждая оставшаяся работа j завершается не раньше t + p_j.
+	// Это безопасно для отсечения, но слабее специальных LB1/LB2 из конспекта.
 	long long lb = 0;
 	for (int job_idx = 0; job_idx < n_; ++job_idx) {
 		if (!is_job_remaining(job_idx)) {
@@ -1229,153 +1846,37 @@ long long dfs_solver::lower_bound_additional(int depth, schedule_time_t current_
 }
 
 long long dfs_solver::heuristic_upper_bound_edd(int depth, schedule_time_t current_time,
-	const std::vector<int>& jobs, int* first_job) {
-	dfs_depth_scratch& scratch = runtime_.scratch_by_depth[static_cast<std::size_t>(depth)];
+	const std::vector<int>& jobs, int* first_job, bool track_stats) {
+	(void)depth;
+	(void)track_stats;
 
-	long long best_cost = 0;
+	// UB строится как стоимость допустимого продолжения расписания pi.
+	// Любой такой pi даёт верхнюю оценку OPT(S,t), но не доказывает оптимальность.
+	long long upper_bound_UB = std::numeric_limits<long long>::max() / 4;
 	int best_first = jobs.empty() ? -1 : jobs.front();
 
-	schedule_time_t t = current_time;
-	for (int job_idx : jobs) {
-		t += static_cast<schedule_time_t>(inst_->jobs[static_cast<std::size_t>(job_idx)].p);
-		best_cost += static_cast<long long>(
-			tardiness(t, inst_->jobs[static_cast<std::size_t>(job_idx)].d));
-	}
-
-	const int m = static_cast<int>(jobs.size());
-	const bool try_mdd =
-		(m > 1) &&
-		((m <= 96) || (depth <= 2 && m <= 512));
-	if (try_mdd) {
-		std::vector<int>& pool = scratch.tmp_a_jobs;
-		pool = jobs;
-
-		long long mdd_cost = 0;
-		int mdd_first = -1;
-		schedule_time_t t_mdd = current_time;
-		while (!pool.empty()) {
-			int best_pos = 0;
-			schedule_time_t best_key = std::numeric_limits<schedule_time_t>::max();
-			due_date_t tie_due = std::numeric_limits<due_date_t>::max();
-			int tie_p = std::numeric_limits<int>::min();
-			int tie_job = std::numeric_limits<int>::max();
-
-			for (int i = 0; i < static_cast<int>(pool.size()); ++i) {
-				const int job_idx = pool[static_cast<std::size_t>(i)];
-				const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
-				const due_date_t due_i = j.d;
-				const schedule_time_t completion = t_mdd + static_cast<schedule_time_t>(j.p);
-				const schedule_time_t mdd_key = (completion > static_cast<schedule_time_t>(due_i))
-					? completion
-					: static_cast<schedule_time_t>(due_i);
-
-				const bool better =
-					(mdd_key < best_key) ||
-					(mdd_key == best_key && due_i < tie_due) ||
-					(mdd_key == best_key && due_i == tie_due && j.p > tie_p) ||
-					(mdd_key == best_key && due_i == tie_due && j.p == tie_p && job_idx < tie_job);
-				if (better) {
-					best_pos = i;
-					best_key = mdd_key;
-					tie_due = due_i;
-					tie_p = j.p;
-					tie_job = job_idx;
-				}
-			}
-
-			const int chosen = pool[static_cast<std::size_t>(best_pos)];
-			if (mdd_first < 0) {
-				mdd_first = chosen;
-			}
-			const job& chosen_job = inst_->jobs[static_cast<std::size_t>(chosen)];
-			t_mdd += static_cast<schedule_time_t>(chosen_job.p);
-			mdd_cost += static_cast<long long>(
-				tardiness(t_mdd, chosen_job.d));
-
-			pool[static_cast<std::size_t>(best_pos)] = pool.back();
-			pool.pop_back();
-
-			if (mdd_cost >= best_cost) {
-				// Early cutoff: already not improving the incumbent heuristic.
-				break;
-			}
+	if (config_.bounds.enable_edd_ub) {
+		long long edd_cost = 0;
+		schedule_time_t t = current_time;
+		for (int job_idx : jobs) {
+			t += static_cast<schedule_time_t>(inst_->jobs[static_cast<std::size_t>(job_idx)].p);
+			edd_cost += static_cast<long long>(
+				tardiness(t, inst_->jobs[static_cast<std::size_t>(job_idx)].d));
 		}
-
-		if (pool.empty() && mdd_cost < best_cost) {
-			best_cost = mdd_cost;
-			best_first = mdd_first;
-		}
-	}
-
-	const bool try_mit =
-		(m > 1) &&
-		((m <= 80) || (depth <= 1 && m <= 256));
-	if (try_mit) {
-		std::vector<int>& pool = scratch.tmp_b_jobs;
-		pool = jobs;
-
-		long long mit_cost = 0;
-		int mit_first = -1;
-		schedule_time_t t_mit = current_time;
-		while (!pool.empty()) {
-			int best_pos = 0;
-			long long best_inc = std::numeric_limits<long long>::max();
-			due_date_t tie_due = std::numeric_limits<due_date_t>::max();
-			int tie_p = std::numeric_limits<int>::min();
-			int tie_job = std::numeric_limits<int>::max();
-
-			for (int i = 0; i < static_cast<int>(pool.size()); ++i) {
-				const int job_idx = pool[static_cast<std::size_t>(i)];
-				const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
-				const schedule_time_t completion = t_mit + static_cast<schedule_time_t>(j.p);
-				const long long inc = static_cast<long long>(
-					tardiness(completion, j.d));
-
-				const bool better =
-					(inc < best_inc) ||
-					(inc == best_inc && j.d < tie_due) ||
-					(inc == best_inc && j.d == tie_due && j.p > tie_p) ||
-					(inc == best_inc && j.d == tie_due && j.p == tie_p && job_idx < tie_job);
-				if (better) {
-					best_pos = i;
-					best_inc = inc;
-					tie_due = j.d;
-					tie_p = j.p;
-					tie_job = job_idx;
-				}
-			}
-
-			const int chosen = pool[static_cast<std::size_t>(best_pos)];
-			if (mit_first < 0) {
-				mit_first = chosen;
-			}
-			const job& chosen_job = inst_->jobs[static_cast<std::size_t>(chosen)];
-			t_mit += static_cast<schedule_time_t>(chosen_job.p);
-			mit_cost += static_cast<long long>(
-				tardiness(t_mit, chosen_job.d));
-
-			pool[static_cast<std::size_t>(best_pos)] = pool.back();
-			pool.pop_back();
-
-			if (mit_cost >= best_cost) {
-				break;
-			}
-		}
-
-		if (pool.empty() && mit_cost < best_cost) {
-			best_cost = mit_cost;
-			best_first = mit_first;
-		}
+		upper_bound_UB = edd_cost;
 	}
 
 	if (first_job != nullptr) {
 		*first_job = best_first;
 	}
-	return best_cost;
+	return upper_bound_UB;
 }
 
-std::vector<int> dfs_solver::reconstruct_order(long long optimal_cost) {
-	std::vector<int> order;
+std::vector<job_id_t> dfs_solver::reconstruct_order(long long optimal_cost) {
+	// Reconstruction идёт по exact-записям M[(S,t)].
+	// Поле best_job хранит первую работу оптимального продолжения для этого состояния.
+	// LB-запись использовать нельзя: она не содержит ни OPT(S,t), ни корректного best_job.
+	std::vector<job_id_t> order;
 	order.reserve(static_cast<std::size_t>(n_));
 
 	schedule_time_t current_time = 0;
@@ -1386,58 +1887,104 @@ std::vector<int> dfs_solver::reconstruct_order(long long optimal_cost) {
 		long long best_total = std::numeric_limits<long long>::max();
 		schedule_time_t best_completion = current_time;
 		long long best_incremental = 0;
+		bool found_exact_continuation = false;
+		// Подсказка best_job берётся только из exact-записи текущего состояния.
+		const memo_lookup_result current_lookup =
+			memo_.query_exact(runtime_.remaining_bits, current_time,
+				runtime_.subset_hash, runtime_.subset_fingerprint, false);
 
-		for (int job_idx = 0; job_idx < n_; ++job_idx) {
+		auto try_job = [&](int job_idx) {
 			if (!is_job_remaining(job_idx)) {
-				continue;
+				return false;
 			}
-
 			const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
 			const schedule_time_t completion = current_time + static_cast<schedule_time_t>(j.p);
-			const long long incremental = static_cast<long long>(
-				tardiness(completion, j.d));
+			const long long incremental = static_cast<long long>(tardiness(completion, j.d));
 			if (incremental > remaining_optimal) {
-				continue;
+				return false;
 			}
 
 			remove_job_from_state(job_idx);
-			memo_lookup_result lookup = query_memo(completion, false);
+			memo_lookup_result lookup =
+				memo_.query_exact(runtime_.remaining_bits, completion,
+					runtime_.subset_hash, runtime_.subset_fingerprint, false);
 			long long rest = 0;
 			if (lookup.found && lookup.has_exact) {
 				rest = lookup.exact;
 			}
 			else {
-				const memo_lookup_result* known = lookup.found ? &lookup : nullptr;
-				rest = solve_state(depth + 1, completion, known, false);
+				// Если exact child-entry нет, подзадача пересчитывается без статистики.
+				// Это сохраняет корректность reconstruction, но может быть дороже.
+				rest = solve_state(depth + 1, completion, nullptr, false);
 			}
 			restore_job_to_state(job_idx);
 
 			const long long total = incremental + rest;
-			if (total < best_total || (total == best_total && job_idx < best_job)) {
+			if (total == remaining_optimal) {
+				best_total = total;
+				best_job = job_idx;
+				best_completion = completion;
+				best_incremental = incremental;
+				found_exact_continuation = true;
+				return true;
+			}
+			if (total < best_total || (total == best_total && (best_job < 0 || job_idx < best_job))) {
 				best_total = total;
 				best_job = job_idx;
 				best_completion = completion;
 				best_incremental = incremental;
 			}
+			return false;
+		};
+
+		const int hinted_job =
+			(current_lookup.found && current_lookup.has_exact && current_lookup.exact == remaining_optimal)
+			? current_lookup.best_job
+			: -1;
+		if (hinted_job >= 0) {
+			(void)try_job(hinted_job);
 		}
 
-		if (best_job < 0 || !is_job_remaining(best_job) || best_total > remaining_optimal) {
+		for (int job_idx = 0; job_idx < n_; ++job_idx) {
+			if (found_exact_continuation) {
+				break;
+			}
+			if (job_idx == hinted_job) {
+				continue;
+			}
+			(void)try_job(job_idx);
+		}
+
+		if (!found_exact_continuation || best_job < 0 || !is_job_remaining(best_job)) {
 			break;
 		}
 
-		order.push_back(best_job);
+		order.push_back(static_cast<job_id_t>(best_job));
 		remove_job_from_state(best_job);
 		current_time = best_completion;
 		remaining_optimal -= best_incremental;
 	}
 
 	for (auto it = order.rbegin(); it != order.rend(); ++it) {
-		restore_job_to_state(*it);
+		restore_job_to_state(static_cast<int>(*it));
 	}
 	return order;
 }
 
 memo_lookup_result dfs_solver::query_memo(schedule_time_t current_time, bool track_stats) {
+	// Полный ключ memo: bitset S + t. Хеш ускоряет поиск, но при совпадении
+	// memo_table всё равно сверяет полный ключ S, чтобы не зависеть от коллизий.
+	if (!config_.memo.enable_memo) {
+		return {};
+	}
+	if (track_stats) {
+		if (config_.memo.enable_exact_memo) {
+			++stats_.memo_exact_queries;
+		}
+		if (config_.memo.enable_lb_memo || config_.bounds.enable_lb_memo) {
+			++stats_.memo_lb_queries;
+		}
+	}
 	if (!track_stats || !config_.profiling.enabled) {
 		return memo_.lookup(runtime_.remaining_bits, current_time,
 			runtime_.subset_hash, runtime_.subset_fingerprint, track_stats);
@@ -1452,6 +1999,10 @@ memo_lookup_result dfs_solver::query_memo(schedule_time_t current_time, bool tra
 }
 
 void dfs_solver::store_exact_memo(schedule_time_t current_time, long long exact, int best_job, bool track_stats) {
+	// Exact-запись хранит полный ответ OPT(S,t) и best_job для восстановления порядка.
+	if (!config_.memo.enable_memo || !config_.memo.enable_exact_memo) {
+		return;
+	}
 	if (!config_.profiling.enabled) {
 		memo_.store_exact(runtime_.remaining_bits, current_time,
 			runtime_.subset_hash, runtime_.subset_fingerprint, exact, best_job, track_stats);
@@ -1466,6 +2017,12 @@ void dfs_solver::store_exact_memo(schedule_time_t current_time, long long exact,
 }
 
 void dfs_solver::store_lower_bound_memo(schedule_time_t current_time, long long lower_bound, bool track_stats) {
+	// LB-запись хранит только нижнюю оценку. Она подходит для pruning,
+	// но не должна использоваться как готовое решение состояния.
+	if (!config_.memo.enable_memo ||
+		!(config_.memo.enable_lb_memo || config_.bounds.enable_lb_memo)) {
+		return;
+	}
 	if (!config_.profiling.enabled) {
 		memo_.store_lower_bound(runtime_.remaining_bits, current_time,
 			runtime_.subset_hash, runtime_.subset_fingerprint, lower_bound, track_stats);

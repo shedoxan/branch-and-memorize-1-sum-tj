@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -17,64 +18,106 @@
 #include <psapi.h>
 #endif
 
+/// Результат поиска подзадачи в M[(S,t)].
+/// Exact-запись означает, что найдено OPT(S,t); LB-запись содержит только
+/// допустимую нижнюю оценку и не подходит для восстановления расписания.
 struct memo_lookup_result {
+	/// Найдена ли какая-либо запись для полного ключа (S,t).
 	bool found = false;
+	/// true только для точной записи OPT(S,t).
 	bool has_exact = false;
+	/// Точное значение OPT(S,t), если has_exact == true.
 	long long exact = 0;
+	/// Нижняя оценка LB(S,t). Exact-запись также является корректной LB.
 	long long lower_bound = 0;
+	/// Первая работа оптимального продолжения; имеет смысл только для exact-записи.
 	int best_job = -1;
 };
 
+/// Внутренняя статистика custom memo backend.
+/// Эти счётчики затем переносятся в solver_stats и попадают в benchmark CSV.
 struct memo_table_stats {
+	/// Успешные lookup по полному ключу (S,t).
 	std::uint64_t hits = 0;
+	/// Неуспешные lookup: состояние не найдено и будет решаться заново.
 	std::uint64_t misses = 0;
+	/// Новые записи, добавленные в M.
 	std::uint64_t inserts = 0;
+	/// Сохранения точных значений OPT(S,t).
+	std::uint64_t exact_stores = 0;
+	/// Сохранения нижних оценок LB(S,t).
+	std::uint64_t lb_stores = 0;
+	/// Обновления уже существующих записей.
 	std::uint64_t updates = 0;
+	/// Все удаления записей из-за capacity или memory limit.
 	std::uint64_t evictions = 0;
+	/// Удаления exact-записей. Это ухудшает скорость, но не нарушает точность.
+	std::uint64_t evictions_exact = 0;
+	/// Удаления LB-записей.
+	std::uint64_t evictions_lb = 0;
+	/// Запись не сохранена, потому что место освободить не удалось.
 	std::uint64_t rejected_no_room = 0;
+	/// Сколько записей удалено принудительно перед вставкой.
 	std::uint64_t forced_evictions = 0;
+	/// Сколько раз запускалась процедура очистки.
 	std::uint64_t clean_calls = 0;
+	/// Сколько LUFO-проходов выполнено.
 	std::uint64_t lufo_decay_passes = 0;
+	/// Максимальное число записей в M за запуск.
 	std::size_t peak_size = 0;
+	/// Число записей в M после последней операции.
 	std::size_t final_size = 0;
+	/// Время, потраченное на очистку/eviction.
 	double clean_time_ms = 0.0;
 };
 
+/// Учёт памяти custom memo backend.
+/// Значение used_bytes является оценкой, а не побайтовым отчётом allocator-а.
 struct memo_memory_accounting {
+	/// Оценка памяти, занятой записями, слотами и payload ключей.
 	std::size_t used_bytes = 0;
+	/// Бюджет памяти для M; 0 означает отсутствие бюджетного ограничения.
 	std::size_t budget_bytes = 0;
+	/// Если true, backend старается не превышать budget_bytes.
 	bool strict_cap = true;
+	/// Если true, на Windows дополнительно проверяется память всего процесса.
 	bool process_memory_gate = false;
 };
 
+/// Диагностические счётчики для проверки качества ключей и hash table.
 struct memo_diagnostics {
+	/// Столкновения hash/start_time или несовпадения полного bitset S.
 	std::uint64_t hash_collisions = 0;
+	/// Сколько раз после hash match выполнялась полная проверка S.
 	std::uint64_t full_key_rechecks = 0;
+	/// Успешные повторные подзадачи: прямой эффект Branch-and-Memorize.
 	std::uint64_t duplicate_subproblem_hits = 0;
-	std::uint64_t fingerprint_mismatches = 0;
 };
 
+/// Custom таблица памяти M для solution memorization.
+/// Ключ exact-записи — полная подзадача (S,t): bitset S хранится явно,
+/// t хранится отдельно, а hash/fingerprint используются только для ускорения.
 class memo_table {
 public:
+	/// Создаёт memo table с ограничением на число записей.
+	/// cap == 0 означает, что ограничение по количеству записей не задано.
 	explicit memo_table(std::size_t cap = 0)
 		: capacity_(cap) {}
 
+	/// Полностью очищает M, но сохраняет настройки memory budget.
 	void clear() {
 		const std::size_t budget_bytes = memory_.budget_bytes;
 		const bool strict_cap = memory_.strict_cap;
 		const bool process_memory_gate = memory_.process_memory_gate;
 
 		entries_.clear();
-		entry_cold_.clear();
+		slot_indices_.clear();
 		slots_.clear();
 		tombstones_ = 0;
 		bits_words_ = 0;
-		bits_segments_.clear();
-		free_bits_blocks_.clear();
-		next_bits_block_id_ = 0;
-		bits_blocks_per_segment_ = 0;
+		key_storage_.clear();
+		free_key_blocks_.clear();
 		lufo_cursor_ = 0;
-		lufo_exact_skip_toggle_ = false;
 
 		stats_ = {};
 		diagnostics_ = {};
@@ -84,11 +127,12 @@ public:
 		memory_.process_memory_gate = process_memory_gate;
 	}
 
+	/// Меняет ограничение на число записей и при необходимости запускает eviction.
 	void set_capacity(std::size_t capacity, bool count_stats = true) {
 		capacity_ = capacity;
 		if (capacity_ > 0) {
 			entries_.reserve(capacity_);
-			entry_cold_.reserve(capacity_);
+			slot_indices_.reserve(capacity_);
 			ensure_slot_table_for_insert(capacity_);
 		}
 		while (capacity_ > 0 && entries_.size() > capacity_) {
@@ -99,6 +143,7 @@ public:
 		stats_.final_size = entries_.size();
 	}
 
+	/// Задаёт бюджет памяти для M и вытесняет записи, если текущая таблица его нарушает.
 	void set_memory_budget_bytes(std::size_t budget_bytes, bool strict_cap) {
 		memory_.budget_bytes = budget_bytes;
 		memory_.strict_cap = strict_cap;
@@ -113,28 +158,32 @@ public:
 		stats_.final_size = entries_.size();
 	}
 
+	/// Включает дополнительную проверку памяти процесса. Используется только на Windows.
 	void set_process_memory_gate(bool enabled) {
 		memory_.process_memory_gate = enabled;
 	}
 
+	/// Управляет измерением времени очистки; выключается для меньших накладных расходов.
 	void set_profiling_timers_enabled(bool enabled) {
 		profiling_timers_enabled_ = enabled;
 	}
 
-	void set_lufo_exact_protection(bool enabled) {
-		lufo_exact_protection_ = enabled;
-	}
-
+	/// Текущее число memo-записей.
 	std::size_t size() const {
 		return entries_.size();
 	}
 
+	/// Текущее ограничение на число записей; 0 означает без такого ограничения.
 	std::size_t capacity() const {
 		return capacity_;
 	}
 
+	/// Ищет состояние (S,t) в M.
+	/// Возвращает exact, если он есть; иначе может вернуть LB-запись.
 	memo_lookup_result lookup(const std::vector<std::uint64_t>& bits, schedule_time_t time,
 		std::uint64_t subset_hash, std::uint64_t subset_fingerprint, bool count_stats = true) {
+		// bits задаёт S, time задаёт t. Хеш и fingerprint только ускоряют поиск:
+		// при совпадении hash обязательно сверяется полный bitset S.
 		memo_lookup_result result{};
 
 		const entry_id id = find_entry(bits, time, subset_hash, subset_fingerprint, count_stats);
@@ -149,8 +198,8 @@ public:
 		const memo_entry& entry = entries_[id];
 		result.found = true;
 		result.has_exact = entry.has_exact;
-		result.exact = entry.exact;
-		result.lower_bound = entry.lower_bound;
+		result.exact = entry.value;
+		result.lower_bound = entry.value;
 		result.best_job = entry.best_job;
 		if (count_stats) {
 			++stats_.hits;
@@ -159,9 +208,13 @@ public:
 		return result;
 	}
 
+	/// Сохраняет нижнюю оценку LB(S,t).
+	/// Если для того же ключа уже есть exact, запись не меняется.
 	void store_lower_bound(const std::vector<std::uint64_t>& bits, schedule_time_t time,
 		std::uint64_t subset_hash, std::uint64_t subset_fingerprint,
 		long long lb, bool count_stats = true) {
+		// Безопасная запись M[(S,t)] = LB(S,t), когда точное OPT ещё не известно.
+		// LB не перезаписывает exact: точная запись важнее любой нижней оценки.
 		if (!prepare_for_bits_size(bits.size())) {
 			if (count_stats) {
 				++stats_.rejected_no_room;
@@ -172,18 +225,16 @@ public:
 		const entry_id existing_id = find_entry(bits, time, subset_hash, subset_fingerprint, count_stats);
 		if (existing_id != invalid_entry_id()) {
 			memo_entry& entry = entries_[existing_id];
-			const std::int64_t old_lb = entry.lower_bound;
+			const std::int64_t old_lb = entry.value;
 
-			if (entry.has_exact) {
-				entry.lower_bound = entry.exact;
-			}
-			else if (lb > entry.lower_bound) {
-				entry.lower_bound = lb;
+			if (!entry.has_exact && lb > entry.value) {
+				entry.value = lb;
 			}
 
 			touch_entry(existing_id);
-			if (count_stats && entry.lower_bound != old_lb) {
+			if (count_stats && entry.value != old_lb) {
 				++stats_.updates;
+				++stats_.lb_stores;
 			}
 			return;
 		}
@@ -199,9 +250,13 @@ public:
 		insert_new_entry(bits, time, subset_hash, subset_fingerprint, false, 0, lb, -1, estimated_bytes, count_stats);
 	}
 
+	/// Сохраняет точное значение OPT(S,t) и best_job для reconstruction.
+	/// Если раньше была LB-запись, она повышается до exact-записи.
 	void store_exact(const std::vector<std::uint64_t>& bits, schedule_time_t time,
 		std::uint64_t subset_hash, std::uint64_t subset_fingerprint,
 		long long exact, int best_job, bool count_stats = true) {
+		// Точная запись M[(S,t)] = OPT(S,t) после полного решения подзадачи.
+		// best_job хранит первую работу оптимального продолжения для reconstruction.
 		if (!prepare_for_bits_size(bits.size())) {
 			if (count_stats) {
 				++stats_.rejected_no_room;
@@ -214,13 +269,9 @@ public:
 			memo_entry& entry = entries_[existing_id];
 			bool changed = false;
 
-			if (!entry.has_exact || entry.exact != exact) {
+			if (!entry.has_exact || entry.value != exact) {
 				entry.has_exact = true;
-				entry.exact = exact;
-				changed = true;
-			}
-			if (entry.lower_bound != exact) {
-				entry.lower_bound = exact;
+				entry.value = exact;
 				changed = true;
 			}
 			if (entry.best_job != best_job) {
@@ -231,6 +282,7 @@ public:
 			touch_entry(existing_id);
 			if (count_stats && changed) {
 				++stats_.updates;
+				++stats_.exact_stores;
 			}
 			return;
 		}
@@ -246,6 +298,7 @@ public:
 		insert_new_entry(bits, time, subset_hash, subset_fingerprint, true, exact, exact, best_job, estimated_bytes, count_stats);
 	}
 
+	/// Возвращает снимок статистики; final_size пересчитывается по текущему entries_.
 	memo_table_stats stats() const {
 		memo_table_stats s = stats_;
 		s.final_size = entries_.size();
@@ -255,18 +308,18 @@ public:
 		return s;
 	}
 
+	/// Возвращает текущую оценку памяти и настройки memory budget.
 	memo_memory_accounting memory_accounting() const {
 		return memory_;
 	}
 
+	/// Возвращает диагностические счётчики hash/full-key verification.
 	memo_diagnostics diagnostics() const {
 		return diagnostics_;
 	}
 
-	void reset_diagnostics() {
-		diagnostics_ = {};
-	}
-
+	/// Проверяет, можно ли добавить запись с оценочным размером estimated_bytes.
+	/// Функция ничего не удаляет; eviction выполняется в ensure_room_for_insert().
 	bool has_room_for_insert(std::size_t estimated_bytes) const {
 		if (capacity_ > 0 && entries_.size() >= capacity_) {
 			return false;
@@ -287,48 +340,51 @@ public:
 	}
 
 private:
+	/// Индекс записи в entries_. uint32_t экономит память в slot table.
 	using entry_id = std::uint32_t;
+	/// Значение ячейки hash table slots_: entry id или служебный маркер.
+	using slot_word = std::uint32_t;
 
-	struct slot {
-		std::uint32_t id = 0;
-		std::uint8_t state = 0; // 0=empty, 1=occupied, 2=tombstone
-	};
-
+	/// Одна запись custom memo table.
+	/// Полный ключ: (S,t), где S лежит в key_storage_, а t — в start_time.
 	struct memo_entry {
-		std::uint64_t subset_hash = 0;
-		std::uint64_t subset_fingerprint = 0;
-		std::int64_t exact = 0;
-		std::int64_t lower_bound = 0;
+		/// Hash пары (S,t) для быстрой адресации в slots_.
+		std::uint64_t key_hash = 0;
+		/// OPT(S,t), если has_exact == true; иначе LB(S,t).
+		std::int64_t value = 0;
 
+		/// t — стартовый момент подзадачи.
 		schedule_time_t start_time = 0;
+		/// Смещение bitset S в key_storage_.
+		std::uint32_t key_offset = 0;
+		/// Первая работа оптимального продолжения; используется только для exact.
 		int best_job = -1;
-		std::int32_t use_count = 0;
-		std::uint32_t bits_block = 0;
+		/// Счётчик полезности записи для LUFO eviction.
+		std::int16_t use_count = 0;
+		/// true означает, что value — это точный OPT(S,t), а не LB.
 		bool has_exact = false;
 	};
 
-	struct memo_entry_cold {
-		std::uint32_t approx_bytes = 0;
-		std::uint32_t slot_index = 0;
-	};
-
-	struct bits_segment {
-		std::vector<std::uint64_t> words;
-		std::uint32_t live_blocks = 0;
-	};
-
-	static constexpr std::uint8_t slot_empty = 0;
-	static constexpr std::uint8_t slot_occupied = 1;
-	static constexpr std::uint8_t slot_tombstone = 2;
+	/// Пустая ячейка open-addressing hash table.
+	static constexpr slot_word slot_empty_id = std::numeric_limits<slot_word>::max();
+	/// Tombstone: запись удалена, но цепочку пробирования разрывать нельзя.
+	static constexpr slot_word slot_tombstone_id = std::numeric_limits<slot_word>::max() - 1;
 
 	static constexpr entry_id invalid_entry_id() {
 		return std::numeric_limits<entry_id>::max();
 	}
 
+	/// В slots_ обычные entry id меньше служебных маркеров empty/tombstone.
+	static bool slot_is_occupied(slot_word value) {
+		return value < slot_tombstone_id;
+	}
+
+	/// Небольшой битовый rotate для смешивания hash компонентов.
 	static std::uint64_t rotate_left64(std::uint64_t x, unsigned int r) {
 		return (x << r) | (x >> (64U - r));
 	}
 
+	/// SplitMix64-подобное перемешивание; снижает кластеризацию hash table.
 	static std::uint64_t mix64(std::uint64_t x) {
 		x ^= (x >> 30);
 		x *= 0xBF58476D1CE4E5B9ULL;
@@ -338,6 +394,7 @@ private:
 		return x;
 	}
 
+	/// Размер slots_ держится степенью двойки, чтобы индекс считать через mask.
 	static std::size_t next_pow2(std::size_t x) {
 		if (x <= 1) {
 			return 1;
@@ -354,6 +411,7 @@ private:
 		return x + 1;
 	}
 
+	/// Текущий working set процесса. На не-Windows возвращает 0.
 	static std::size_t current_process_memory_bytes() {
 #ifdef _WIN32
 		PROCESS_MEMORY_COUNTERS_EX pmc{};
@@ -368,14 +426,15 @@ private:
 #endif
 	}
 
+	/// Проверяет, что все ключи в таблице имеют одинаковый размер bitset.
+	/// Для одной задачи n фиксировано, поэтому изменение words допускается только
+	/// до появления первой записи.
 	bool prepare_for_bits_size(std::size_t words) {
 		if (entries_.empty()) {
 			if (bits_words_ != words) {
 				bits_words_ = words;
-				bits_segments_.clear();
-				free_bits_blocks_.clear();
-				next_bits_block_id_ = 0;
-				bits_blocks_per_segment_ = 0;
+				key_storage_.clear();
+				free_key_blocks_.clear();
 				slots_.clear();
 				tombstones_ = 0;
 				lufo_cursor_ = 0;
@@ -385,22 +444,37 @@ private:
 		return bits_words_ == words;
 	}
 
+	/// Оценка памяти новой записи для memory budget.
 	std::size_t estimate_entry_bytes(const std::vector<std::uint64_t>& bits) const {
-		const std::size_t bits_payload = bits.size() * sizeof(std::uint64_t);
-		const std::size_t slot_share = sizeof(slot) * 3; // rough share with load factor slack
-		const std::size_t arena_bookkeeping = sizeof(std::size_t) * 2;
-		return sizeof(memo_entry) + sizeof(memo_entry_cold) +
-			bits_payload + slot_share + arena_bookkeeping;
+		return estimate_entry_bytes_from_words(bits.size());
 	}
 
+	/// Оценка памяти уже сохранённой записи.
+	std::size_t estimate_stored_entry_bytes() const {
+		return estimate_entry_bytes_from_words(bits_words_);
+	}
+
+	/// Грубая оценка: entry + payload bitset + доля hash slots и bookkeeping.
+	std::size_t estimate_entry_bytes_from_words(std::size_t word_count) const {
+		const std::size_t payload = word_count * sizeof(std::uint64_t);
+		const std::size_t slot_share = sizeof(slot_word) * 3; // приближённая доля slots_ с запасом на load factor
+		const std::size_t arena_bookkeeping = sizeof(std::size_t) * 2;
+		return sizeof(memo_entry) + sizeof(std::uint32_t) +
+			payload + slot_share + arena_bookkeeping;
+	}
+
+	/// Строит hash для пары (S,t). subset_hash/subset_fingerprint описывают только S,
+	/// поэтому time обязательно добавляется отдельно.
 	std::uint64_t probe_hash(std::uint64_t subset_hash,
 		std::uint64_t subset_fingerprint,
 		schedule_time_t time) const {
+		// Хеширует пару (S,t): Zobrist-хеш множества S плюс стартовый момент t.
 		const std::uint64_t t = static_cast<std::uint64_t>(time);
 		return mix64(subset_hash ^ rotate_left64(subset_fingerprint, 21) ^
 			mix64(t + 0x9E3779B97F4A7C15ULL));
 	}
 
+	/// Готовит open-addressing table к вставке: расширяет или чистит tombstones.
 	void ensure_slot_table_for_insert(std::size_t target_entries) {
 		if (target_entries == 0) {
 			return;
@@ -433,34 +507,34 @@ private:
 		}
 	}
 
+	/// Перестраивает slots_ без изменения entries_ и payload ключей.
 	void rehash_slots(std::size_t requested_slots) {
 		const std::size_t slot_count = next_pow2(std::max<std::size_t>(16, requested_slots));
-		std::vector<slot> new_slots(slot_count);
+		std::vector<slot_word> new_slots(slot_count, slot_empty_id);
 
 		for (entry_id id = 0; id < static_cast<entry_id>(entries_.size()); ++id) {
 			memo_entry& entry = entries_[id];
-			const std::size_t idx = find_insert_slot_in(new_slots, probe_hash(
-				entry.subset_hash, entry.subset_fingerprint, entry.start_time));
-			new_slots[idx].state = slot_occupied;
-			new_slots[idx].id = id;
-			entry_cold_[id].slot_index = static_cast<std::uint32_t>(idx);
+			const std::size_t idx = find_insert_slot_in(new_slots, entry.key_hash);
+			new_slots[idx] = id;
+			slot_indices_[id] = static_cast<std::uint32_t>(idx);
 		}
 
 		slots_.swap(new_slots);
 		tombstones_ = 0;
 	}
 
-	static std::size_t find_insert_slot_in(std::vector<slot>& slots, std::uint64_t h) {
+	/// Ищет bucket для вставки по linear probing, переиспользуя первый tombstone.
+	static std::size_t find_insert_slot_in(std::vector<slot_word>& slots, std::uint64_t h) {
 		const std::size_t mask = slots.size() - 1;
 		std::size_t idx = static_cast<std::size_t>(h) & mask;
 		std::size_t first_tombstone = std::numeric_limits<std::size_t>::max();
 
 		for (std::size_t step = 0; step < slots.size(); ++step) {
-			slot& s = slots[idx];
-			if (s.state == slot_empty) {
+			const slot_word s = slots[idx];
+			if (s == slot_empty_id) {
 				return (first_tombstone != std::numeric_limits<std::size_t>::max()) ? first_tombstone : idx;
 			}
-			if (s.state == slot_tombstone && first_tombstone == std::numeric_limits<std::size_t>::max()) {
+			if (s == slot_tombstone_id && first_tombstone == std::numeric_limits<std::size_t>::max()) {
 				first_tombstone = idx;
 			}
 			idx = (idx + 1) & mask;
@@ -469,134 +543,66 @@ private:
 		return (first_tombstone != std::numeric_limits<std::size_t>::max()) ? first_tombstone : 0;
 	}
 
-	std::size_t compute_bits_blocks_per_segment() const {
-		if (bits_words_ == 0) {
+	/// Выделяет блок в key_storage_ или переиспользует освобождённый блок того же размера.
+	std::uint32_t allocate_key_block(std::size_t word_count) {
+		if (word_count == 0) {
 			return 0;
 		}
-		constexpr std::size_t target_segment_bytes = 2u * 1024u * 1024u; // 2 MiB
-		const std::size_t target_words =
-			std::max<std::size_t>(bits_words_, target_segment_bytes / sizeof(std::uint64_t));
-		std::size_t blocks = target_words / bits_words_;
-		if (blocks == 0) {
-			blocks = 1;
+		if (free_key_blocks_.size() <= word_count) {
+			free_key_blocks_.resize(static_cast<std::size_t>(word_count) + 1U);
 		}
-		if (blocks < 256) {
-			blocks = 256;
+		std::vector<std::uint32_t>& free_list = free_key_blocks_[word_count];
+		if (!free_list.empty()) {
+			const std::uint32_t offset = free_list.back();
+			free_list.pop_back();
+			return offset;
 		}
-		if (blocks > 16384) {
-			blocks = 16384;
-		}
-		return blocks;
+
+		const std::size_t offset = key_storage_.size();
+		key_storage_.resize(offset + word_count, 0);
+		return static_cast<std::uint32_t>(offset);
 	}
 
-	void ensure_bits_segment_config() {
-		if (bits_words_ == 0) {
-			bits_blocks_per_segment_ = 0;
-			return;
-		}
-		if (bits_blocks_per_segment_ == 0) {
-			bits_blocks_per_segment_ = compute_bits_blocks_per_segment();
-		}
-	}
-
-	void ensure_bits_segment_for_block(std::uint32_t block) {
-		if (bits_words_ == 0) {
-			return;
-		}
-		ensure_bits_segment_config();
-		if (bits_blocks_per_segment_ == 0) {
-			return;
-		}
-		const std::size_t seg_idx =
-			static_cast<std::size_t>(block) / bits_blocks_per_segment_;
-		const std::size_t segment_words = bits_blocks_per_segment_ * bits_words_;
-		while (bits_segments_.size() <= seg_idx) {
-			bits_segment seg;
-			seg.words.resize(segment_words, 0);
-			bits_segments_.push_back(std::move(seg));
-		}
-	}
-
-	std::size_t bits_segment_index(std::uint32_t block) const {
-		if (bits_blocks_per_segment_ == 0) {
-			return 0;
-		}
-		return static_cast<std::size_t>(block) / bits_blocks_per_segment_;
-	}
-
-	std::size_t bits_segment_offset_words(std::uint32_t block) const {
-		if (bits_blocks_per_segment_ == 0) {
-			return 0;
-		}
-		const std::size_t in_segment = static_cast<std::size_t>(block) % bits_blocks_per_segment_;
-		return in_segment * bits_words_;
-	}
-
-	std::uint64_t* bits_block_ptr_mut(std::uint32_t block) {
+	/// Mutable pointer на сохранённый bitset S.
+	std::uint64_t* key_block_ptr_mut(std::uint32_t offset) {
 		if (bits_words_ == 0) {
 			return nullptr;
 		}
-		ensure_bits_segment_for_block(block);
-		const std::size_t seg_idx = bits_segment_index(block);
-		if (seg_idx >= bits_segments_.size()) {
-			return nullptr;
-		}
-		return bits_segments_[seg_idx].words.data() + bits_segment_offset_words(block);
+		return key_storage_.data() + offset;
 	}
 
-	const std::uint64_t* bits_block_ptr(std::uint32_t block) const {
-		if (bits_words_ == 0 || bits_blocks_per_segment_ == 0) {
-			return nullptr;
-		}
-		const std::size_t seg_idx = bits_segment_index(block);
-		if (seg_idx >= bits_segments_.size()) {
-			return nullptr;
-		}
-		return bits_segments_[seg_idx].words.data() + bits_segment_offset_words(block);
-	}
-
-	std::uint32_t allocate_bits_block(const std::vector<std::uint64_t>& bits) {
+	/// Const pointer на сохранённый bitset S.
+	const std::uint64_t* key_block_ptr(std::uint32_t offset) const {
 		if (bits_words_ == 0) {
-			return 0;
+			return nullptr;
 		}
-		ensure_bits_segment_config();
-
-		std::uint32_t block = 0;
-		if (!free_bits_blocks_.empty()) {
-			block = free_bits_blocks_.back();
-			free_bits_blocks_.pop_back();
-		}
-		else {
-			block = next_bits_block_id_++;
-		}
-
-		std::uint64_t* dst = bits_block_ptr_mut(block);
-		if (dst == nullptr) {
-			return 0;
-		}
-		const std::size_t seg_idx = bits_segment_index(block);
-		if (seg_idx < bits_segments_.size()) {
-			++bits_segments_[seg_idx].live_blocks;
-		}
-		for (std::size_t i = 0; i < bits_words_; ++i) {
-			dst[i] = bits[i];
-		}
-		return block;
+		return key_storage_.data() + offset;
 	}
 
-	void release_bits_block(std::uint32_t block) {
+	/// Копирует полный bitset S в key_storage_ и записывает offset в entry.
+	void store_key_payload(memo_entry& entry, const std::vector<std::uint64_t>& bits) {
+		entry.key_offset = allocate_key_block(bits_words_);
+
+		std::uint64_t* dst = key_block_ptr_mut(entry.key_offset);
 		if (bits_words_ == 0) {
 			return;
 		}
-		if (bits_blocks_per_segment_ > 0) {
-			const std::size_t seg_idx = bits_segment_index(block);
-			if (seg_idx < bits_segments_.size() && bits_segments_[seg_idx].live_blocks > 0) {
-				--bits_segments_[seg_idx].live_blocks;
-			}
-		}
-		free_bits_blocks_.push_back(block);
+		std::fill(dst, dst + bits_words_, 0);
+		std::memcpy(dst, bits.data(), bits_words_ * sizeof(std::uint64_t));
 	}
 
+	/// Возвращает блок bitset S в free list; память арены не уменьшается.
+	void release_key_block(const memo_entry& entry) {
+		if (bits_words_ == 0) {
+			return;
+		}
+		if (free_key_blocks_.size() <= bits_words_) {
+			free_key_blocks_.resize(bits_words_ + 1U);
+		}
+		free_key_blocks_[bits_words_].push_back(entry.key_offset);
+	}
+
+	/// Полная проверка S. Это защита от hash/fingerprint collisions.
 	bool bits_equal(const memo_entry& entry, const std::vector<std::uint64_t>& bits) const {
 		if (bits.size() != bits_words_) {
 			return false;
@@ -604,28 +610,26 @@ private:
 		if (bits_words_ == 0) {
 			return true;
 		}
-		const std::uint64_t* stored = bits_block_ptr(entry.bits_block);
+		const std::uint64_t* stored = key_block_ptr(entry.key_offset);
 		if (stored == nullptr) {
 			return false;
 		}
-		for (std::size_t i = 0; i < bits_words_; ++i) {
-			if (stored[i] != bits[i]) {
-				return false;
-			}
-		}
-		return true;
+		return std::memcmp(stored, bits.data(), bits_words_ * sizeof(std::uint64_t)) == 0;
 	}
 
+	/// Отмечает использование записи: часто используемые состояния живут дольше.
 	void touch_entry(entry_id id) {
 		if (id >= entries_.size()) {
 			return;
 		}
 		memo_entry& entry = entries_[id];
-		if (entry.use_count < std::numeric_limits<std::int32_t>::max()) {
+		if (entry.use_count < std::numeric_limits<std::int16_t>::max()) {
 			++entry.use_count;
 		}
 	}
 
+	/// Ищет запись по полному ключу (S,t).
+	/// Hash указывает область поиска, но результат принимается только после bits_equal().
 	entry_id find_entry(const std::vector<std::uint64_t>& bits, schedule_time_t time,
 		std::uint64_t subset_hash, std::uint64_t subset_fingerprint, bool count_stats) {
 		if (entries_.empty() || slots_.empty()) {
@@ -635,17 +639,19 @@ private:
 			return invalid_entry_id();
 		}
 
+		const std::uint64_t key_hash = probe_hash(subset_hash, subset_fingerprint, time);
 		const std::size_t mask = slots_.size() - 1;
-		std::size_t idx = static_cast<std::size_t>(probe_hash(subset_hash, subset_fingerprint, time)) & mask;
+		std::size_t idx = static_cast<std::size_t>(key_hash) & mask;
 
 		for (std::size_t step = 0; step < slots_.size(); ++step) {
-			const slot& s = slots_[idx];
-			if (s.state == slot_empty) {
+			const slot_word s = slots_[idx];
+			if (s == slot_empty_id) {
 				return invalid_entry_id();
 			}
-			if (s.state == slot_occupied) {
-				const memo_entry& entry = entries_[s.id];
-				if (entry.subset_hash != subset_hash) {
+			if (slot_is_occupied(s)) {
+				const entry_id id = static_cast<entry_id>(s);
+				const memo_entry& entry = entries_[id];
+				if (entry.key_hash != key_hash) {
 					if (count_stats) {
 						++diagnostics_.hash_collisions;
 					}
@@ -655,18 +661,12 @@ private:
 						++diagnostics_.hash_collisions;
 					}
 				}
-				else if (entry.subset_fingerprint != subset_fingerprint) {
-					if (count_stats) {
-						++diagnostics_.hash_collisions;
-						++diagnostics_.fingerprint_mismatches;
-					}
-				}
 				else {
 					if (count_stats) {
 						++diagnostics_.full_key_rechecks;
 					}
 					if (bits_equal(entry, bits)) {
-						return s.id;
+						return id;
 					}
 					if (count_stats) {
 						++diagnostics_.hash_collisions;
@@ -679,6 +679,7 @@ private:
 		return invalid_entry_id();
 	}
 
+	/// Добавляет новую запись. Перед вызовом место уже должно быть подготовлено.
 	void insert_new_entry(const std::vector<std::uint64_t>& bits, schedule_time_t time,
 		std::uint64_t subset_hash, std::uint64_t subset_fingerprint,
 		bool has_exact, long long exact, long long lower_bound, int best_job,
@@ -689,32 +690,34 @@ private:
 		}
 
 		memo_entry entry;
-		entry.bits_block = allocate_bits_block(bits);
 		entry.start_time = time;
-		entry.subset_hash = subset_hash;
-		entry.subset_fingerprint = subset_fingerprint;
+		entry.key_hash = probe_hash(subset_hash, subset_fingerprint, time);
 		entry.has_exact = has_exact;
-		entry.exact = exact;
-		entry.lower_bound = lower_bound;
+		entry.value = has_exact ? exact : lower_bound;
 		entry.best_job = best_job;
 		entry.use_count = 1;
+		store_key_payload(entry, bits);
 
 		entries_.push_back(std::move(entry));
 		const entry_id new_id = static_cast<entry_id>(entries_.size() - 1);
-		entry_cold_.push_back({ static_cast<std::uint32_t>(estimated_bytes), 0U });
+		slot_indices_.push_back(0U);
 
-		const std::uint64_t h = probe_hash(subset_hash, subset_fingerprint, time);
-		const std::size_t slot_idx = find_insert_slot_in(slots_, h);
-		if (slots_[slot_idx].state == slot_tombstone && tombstones_ > 0) {
+		const std::size_t slot_idx = find_insert_slot_in(slots_, entry.key_hash);
+		if (slots_[slot_idx] == slot_tombstone_id && tombstones_ > 0) {
 			--tombstones_;
 		}
-		slots_[slot_idx].state = slot_occupied;
-		slots_[slot_idx].id = new_id;
-		entry_cold_[new_id].slot_index = static_cast<std::uint32_t>(slot_idx);
+		slots_[slot_idx] = new_id;
+		slot_indices_[new_id] = static_cast<std::uint32_t>(slot_idx);
 
 		memory_.used_bytes += estimated_bytes;
 		if (count_stats) {
 			++stats_.inserts;
+			if (has_exact) {
+				++stats_.exact_stores;
+			}
+			else {
+				++stats_.lb_stores;
+			}
 		}
 		if (entries_.size() > stats_.peak_size) {
 			stats_.peak_size = entries_.size();
@@ -722,33 +725,35 @@ private:
 		stats_.final_size = entries_.size();
 	}
 
+	/// Удаляет запись из M.
+	/// Удаление exact-записи не нарушает оптимальность: состояние будет решено заново.
 	void erase_entry(entry_id id, bool count_stats) {
 		if (id >= entries_.size()) {
 			return;
 		}
 
-		const std::size_t removed_slot = entry_cold_[id].slot_index;
-		const std::uint32_t removed_block = entries_[id].bits_block;
-		const std::size_t removed_bytes = entry_cold_[id].approx_bytes;
+		const std::size_t removed_slot = slot_indices_[id];
+		const std::size_t removed_bytes = estimate_stored_entry_bytes();
+		const bool removed_exact = entries_[id].has_exact;
 
-		if (removed_slot < slots_.size() && slots_[removed_slot].state == slot_occupied) {
-			slots_[removed_slot].state = slot_tombstone;
+		if (removed_slot < slots_.size() && slot_is_occupied(slots_[removed_slot])) {
+			slots_[removed_slot] = slot_tombstone_id;
 			++tombstones_;
 		}
 
-		release_bits_block(removed_block);
+		release_key_block(entries_[id]);
 
 		const entry_id last_id = static_cast<entry_id>(entries_.size() - 1);
 		if (id != last_id) {
 			entries_[id] = std::move(entries_[last_id]);
-			entry_cold_[id] = entry_cold_[last_id];
-			const std::size_t moved_slot = entry_cold_[id].slot_index;
-			if (moved_slot < slots_.size() && slots_[moved_slot].state == slot_occupied) {
-				slots_[moved_slot].id = id;
+			slot_indices_[id] = slot_indices_[last_id];
+			const std::size_t moved_slot = slot_indices_[id];
+			if (moved_slot < slots_.size() && slot_is_occupied(slots_[moved_slot])) {
+				slots_[moved_slot] = id;
 			}
 		}
 		entries_.pop_back();
-		entry_cold_.pop_back();
+		slot_indices_.pop_back();
 		if (lufo_cursor_ >= entries_.size()) {
 			lufo_cursor_ = 0;
 		}
@@ -762,6 +767,12 @@ private:
 
 		if (count_stats) {
 			++stats_.evictions;
+			if (removed_exact) {
+				++stats_.evictions_exact;
+			}
+			else {
+				++stats_.evictions_lb;
+			}
 		}
 		stats_.final_size = entries_.size();
 
@@ -770,6 +781,7 @@ private:
 		}
 	}
 
+	/// Размер одного LUFO-прохода: чистка должна быть ограниченной, чтобы store не зависал.
 	std::size_t lufo_decay_batch_size() const {
 		const std::size_t n = entries_.size();
 		if (n <= 256) {
@@ -785,6 +797,7 @@ private:
 		return std::min(batch, n);
 	}
 
+	/// LUFO-подобное старение: use_count уменьшается, записи с отрицательным счётчиком удаляются.
 	std::size_t evict_lufo_decay_pass(bool count_stats) {
 		if (entries_.empty()) {
 			lufo_cursor_ = 0;
@@ -792,13 +805,10 @@ private:
 		}
 
 		++stats_.lufo_decay_passes;
-		if (lufo_exact_protection_) {
-			lufo_exact_skip_toggle_ = !lufo_exact_skip_toggle_;
-		}
 		std::size_t removed = 0;
 		std::size_t scanned = 0;
 		const std::size_t scan_budget = lufo_decay_batch_size();
-		const std::int32_t use_count_min = std::numeric_limits<std::int32_t>::min();
+		const std::int16_t use_count_min = std::numeric_limits<std::int16_t>::min();
 		while (!entries_.empty() && scanned < scan_budget) {
 			if (lufo_cursor_ >= entries_.size()) {
 				lufo_cursor_ = 0;
@@ -806,9 +816,7 @@ private:
 
 			const entry_id i = static_cast<entry_id>(lufo_cursor_);
 			memo_entry& entry = entries_[i];
-			const bool skip_exact_decay =
-				lufo_exact_protection_ && lufo_exact_skip_toggle_ && entry.has_exact;
-			if (!skip_exact_decay && entry.use_count > use_count_min) {
+			if (entry.use_count > use_count_min) {
 				--entry.use_count;
 			}
 			if (entry.use_count < 0) {
@@ -822,10 +830,12 @@ private:
 		return removed;
 	}
 
+	/// Пытается удалить хотя бы одну запись текущей политикой.
 	bool evict_one_by_policy(bool count_stats) {
 		return evict_by_policy(count_stats) > 0;
 	}
 
+	/// Единая точка запуска eviction. Сейчас политика фактически LUFO decay.
 	std::size_t evict_by_policy(bool count_stats) {
 		if (entries_.empty()) {
 			return 0;
@@ -844,6 +854,8 @@ private:
 		return removed;
 	}
 
+	/// Освобождает место для новой записи. Если место получить не удалось,
+	/// store просто откажется от сохранения, что не меняет exact objective.
 	bool ensure_room_for_insert(std::size_t estimated_bytes, bool count_stats) {
 		while (!has_room_for_insert(estimated_bytes)) {
 			if (entries_.empty()) {
@@ -860,23 +872,32 @@ private:
 		return has_room_for_insert(estimated_bytes);
 	}
 
+	/// Плотный массив записей M. entry_id является индексом в этом массиве.
 	std::vector<memo_entry> entries_;
-	std::vector<memo_entry_cold> entry_cold_;
-	std::vector<slot> slots_;
+	/// Для каждой entries_[id] хранит индекс bucket-а в slots_.
+	std::vector<std::uint32_t> slot_indices_;
+	/// Open-addressing hash table: bucket -> entry_id / empty / tombstone.
+	std::vector<slot_word> slots_;
+	/// Число tombstone bucket-ов; при избытке запускается rehash.
 	std::size_t tombstones_ = 0;
 
+	/// Сколько uint64_t занимает bitset S для данной задачи.
 	std::size_t bits_words_ = 0;
-	std::vector<bits_segment> bits_segments_;
-	std::vector<std::uint32_t> free_bits_blocks_;
-	std::uint32_t next_bits_block_id_ = 0;
-	std::size_t bits_blocks_per_segment_ = 0;
+	/// Арена для полных bitset-ключей S.
+	std::vector<std::uint64_t> key_storage_;
+	/// Free lists блоков key_storage_ по размеру word_count.
+	std::vector<std::vector<std::uint32_t>> free_key_blocks_;
 
+	/// Текущая позиция кругового LUFO-сканирования.
 	std::size_t lufo_cursor_ = 0;
+	/// Максимальное число записей; 0 означает без ограничения по количеству.
 	std::size_t capacity_ = 0;
+	/// Включены ли внутренние таймеры очистки.
 	bool profiling_timers_enabled_ = true;
-	bool lufo_exact_protection_ = false;
-	bool lufo_exact_skip_toggle_ = false;
+	/// Статистика операций memo table.
 	memo_table_stats stats_{};
+	/// Оценка памяти и бюджет.
 	memo_memory_accounting memory_{};
+	/// Диагностика hash/full-key verification.
 	memo_diagnostics diagnostics_{};
 };

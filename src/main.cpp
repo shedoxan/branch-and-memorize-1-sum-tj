@@ -1,4 +1,4 @@
-#include <algorithm>
+﻿#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <csignal>
@@ -12,7 +12,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "dfs_solver.h"
@@ -47,15 +46,29 @@ struct cli_options {
 	std::uint64_t seed = 1;
 	std::size_t memo_capacity = 0; // 0 -> unlimited by entry count
 	std::size_t mem_budget_mb = 1024;
+	bool use_upper_bounds = false;
 	bool use_lower_bounds = false;
-	bool use_decomposition2 = true;
-	bool use_lawler_position_filter = true;
-	bool use_lawler_rule12 = false;
+	bool use_terminal_rules = true;
+	bool enable_rule4 = true;
+	bool position_filtering_enabled = true;
+	bool enable_lawler_basic_rules = true;
+	bool explicit_lb_flags = false;
+	bool enable_simple_lb = false;
+	bool enable_lb_memo = false;
+	bool explicit_ub_flags = false;
+	bool enable_edd_ub = false;
+	int ub_depth_limit = -1;
+	int lb_depth_limit = -1;
+	bool enable_terminal_all_tardy_spt = true;
+	bool enable_terminal_edd_at_most_one_tardy = true;
 	bool use_process_memory_gate = false;
-	bool use_double_pair_lb_prune = false;
-	bool use_lufo_exact_protect = false;
+	bool enable_memo = true;
+	bool enable_exact_memo = true;
+	bool memo_full_key_verification = true;
+	memo_backend_kind memo_backend = memo_backend_kind::custom;
 	bool profiling_enabled = true;
-	decomposition_policy decomp_policy = decomposition_policy::adaptive;
+	DecompositionMode decomposition_mode = DecompositionMode::Adaptive;
+	adaptive_policy_kind adaptive_policy = adaptive_policy_kind::v1;
 
 	std::string bench_csv_path;
 	std::string n_list_text;
@@ -85,23 +98,35 @@ void print_usage() {
 		<< "  --due-tardiness <double>  Potts T parameter (default: 0.6)\n"
 		<< "  --memo-capacity <size>    Max memo entries, 0 = unlimited (default: 0)\n"
 		<< "  --mem-budget-mb <size>    Memo memory budget in MB (default: 1024)\n"
+		<< "  --enable-memo / --disable-memo Toggle memoization globally (default: enabled)\n"
+		<< "  --enable-exact-memo / --disable-exact-memo Toggle exact memo entries (default: enabled)\n"
+		<< "  --enable-lb-memo / --disable-lb-memo Toggle lower-bound memo entries (default: follows --use-lb)\n"
+		<< "  --memo-full-key-verification / --no-memo-full-key-verification Exact-safe memo key checking (default: on)\n"
+		<< "  --no-ub                   Disable heuristic upper-bound incumbent (default)\n"
+		<< "  --use-ub                  Enable heuristic upper-bound incumbent\n"
+		<< "  --enable-edd-ub / --disable-edd-ub Toggle EDD upper bound\n"
+		<< "  --ub-depth-limit <int>    Limit UB calls by recursion depth, -1 = unlimited\n"
 		<< "  --no-lb                   Disable lower-bound pruning (default)\n"
 		<< "  --use-lb                  Enable lower-bound pruning\n"
-		<< "  --no-decomp2              Disable decomposition-2 branching\n"
-		<< "  --decomp2                 Enable decomposition-2 branching (default)\n"
-		<< "  --double-lb-prune         Extra LB pruning inside double decomposition (experimental)\n"
-		<< "  --no-double-lb-prune      Disable extra LB pruning inside double decomposition (default)\n"
-		<< "  --lufo-protect-exact      LUFO: age exact memo entries slower (experimental)\n"
-		<< "  --no-lufo-protect-exact   Disable LUFO exact-entry protection (default)\n"
-		<< "  --no-lawler-filter        Disable Lawler position filter\n"
-		<< "  --lawler-filter           Enable Lawler position filter (default)\n"
-		<< "  --lawler-rule12          Enable additional proven Lawler rules 1/2 (experimental exact-safe)\n"
-		<< "  --no-lawler-rule12       Disable additional proven Lawler rules 1/2 (default)\n"
-		<< "  --decomp-policy <mode>    Decomposition policy: adaptive|lawler|szwarc|both (default: adaptive)\n"
+		<< "  --enable-simple-lb / --disable-simple-lb Toggle cheap admissible LB\n"
+		<< "  --lb-depth-limit <int>    Limit LB calls by recursion depth, -1 = unlimited\n"
+		<< "  --terminal-rules          Enable exact terminal rules (default)\n"
+		<< "  --no-terminal-rules       Disable exact terminal rules\n"
+		<< "  --enable-terminal-all-tardy-spt / --disable-terminal-all-tardy-spt Toggle all-tardy SPT terminal rule\n"
+		<< "  --enable-terminal-edd-at-most-one-tardy / --disable-terminal-edd-at-most-one-tardy Toggle EDD terminal rule\n"
+		<< "  --memo-backend <mode>     Memo backend: custom|std_unordered (default: custom)\n"
+		<< "  --enable-position-filtering / --disable-position-filtering Toggle all position filters\n"
+		<< "  --enable-lawler-basic-rules / --disable-lawler-basic-rules Toggle Lawler position rules\n"
+		<< "  --enable-rule4           Enable Rule 4 position reduction (default)\n"
+		<< "  --disable-rule4          Disable Rule 4 position reduction\n"
+		<< "  --preset <name>           Named preset: best-final\n"
+		<< "  --model <name>             Model: lawler|szwarc|both|adaptive_v1|adaptive_v2|adaptive_v3\n"
+		<< "  --decomposition <mode>    Decomposition mode: lawler|szwarc|both|adaptive\n"
+		<< "  --adaptive-policy <v1|v2|v3> Adaptive policy version (default: v1)\n"
 		<< "  --process-memory-gate     Cap memo by process working set too (off by default)\n"
 		<< "  --profiling              Enable internal profiling counters/timers (default: on)\n"
 		<< "  --no-profiling           Disable internal profiling timers for cleaner speed benchmarks\n"
-		<< "  --profile-article         Preset: R=0.2 T=0.6 no-LB rule12-off decomp2+LawlerFilter adaptive memo-capacity=0\n"
+		<< "  --profile-article         Preset: R=0.2 T=0.6 no-LB adaptive memo-capacity=0\n"
 		<< "  --reconstruct             Enable order reconstruction (default: off)\n"
 		<< "  --no-reconstruct          Disable order reconstruction\n"
 		<< "  --help                    Show this help\n";
@@ -297,6 +322,92 @@ bool load_instance_from_file_auto(const std::string& path, instance& out, std::s
 	return true;
 }
 
+std::string active_components_text(const cli_options& opts) {
+	std::string components;
+	switch (opts.decomposition_mode) {
+	case DecompositionMode::Lawler:
+		components = "lawler";
+		break;
+	case DecompositionMode::Szwarc:
+		components = "szwarc";
+		break;
+	case DecompositionMode::BothLawlerSzwarc:
+		components = "lawler+szwarc";
+		break;
+	case DecompositionMode::Adaptive:
+		components = "adaptive(lawler,szwarc,both)";
+		break;
+	default:
+		components = "unknown";
+		break;
+	}
+	return components;
+}
+
+std::string model_name_text(const cli_options& opts) {
+	if (opts.decomposition_mode == DecompositionMode::Adaptive) {
+		switch (opts.adaptive_policy) {
+		case adaptive_policy_kind::v2:
+			return "adaptive_v2";
+		case adaptive_policy_kind::v3:
+			return "adaptive_v3";
+		case adaptive_policy_kind::v1:
+		default:
+			return "adaptive_v1";
+		}
+	}
+	return to_string(opts.decomposition_mode);
+}
+
+bool apply_model_name(const std::string& value, cli_options& opts) {
+	std::string model = value;
+	for (char& ch : model) {
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	}
+	if (model == "adaptive_v1" || model == "adaptive-v1") {
+		opts.decomposition_mode = DecompositionMode::Adaptive;
+		opts.adaptive_policy = adaptive_policy_kind::v1;
+		return true;
+	}
+	if (model == "adaptive_v2" || model == "adaptive-v2") {
+		opts.decomposition_mode = DecompositionMode::Adaptive;
+		opts.adaptive_policy = adaptive_policy_kind::v2;
+		return true;
+	}
+	if (model == "adaptive_v3" || model == "adaptive-v3") {
+		opts.decomposition_mode = DecompositionMode::Adaptive;
+		opts.adaptive_policy = adaptive_policy_kind::v3;
+		return true;
+	}
+	DecompositionMode parsed{};
+	if (!parse_decomposition_mode(model, parsed)) {
+		return false;
+	}
+	opts.decomposition_mode = parsed;
+	return true;
+}
+
+void apply_best_final_preset(cli_options& opts) {
+	opts.decomposition_mode = DecompositionMode::Adaptive;
+	opts.adaptive_policy = adaptive_policy_kind::v3;
+	opts.memo_backend = memo_backend_kind::custom;
+	opts.memo_full_key_verification = true;
+	opts.enable_memo = true;
+	opts.enable_exact_memo = true;
+}
+
+bool apply_preset_name(const std::string& value, cli_options& opts) {
+	std::string preset = value;
+	for (char& ch : preset) {
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	}
+	if (preset == "best-final" || preset == "best_final" || preset == "bestfinal") {
+		apply_best_final_preset(opts);
+		return true;
+	}
+	return false;
+}
+
 bool parse_cli(int argc, char** argv, cli_options& opts, std::string& error, bool& show_help) {
 	show_help = false;
 
@@ -316,54 +427,138 @@ bool parse_cli(int argc, char** argv, cli_options& opts, std::string& error, boo
 		}
 		if (arg == "--no-lb") {
 			opts.use_lower_bounds = false;
+			opts.explicit_lb_flags = false;
+			opts.enable_simple_lb = false;
+			opts.enable_lb_memo = false;
 			continue;
 		}
 		if (arg == "--use-lb") {
 			opts.use_lower_bounds = true;
+			opts.explicit_lb_flags = false;
 			continue;
 		}
-		if (arg == "--no-decomp2") {
-			opts.use_decomposition2 = false;
+		if (arg == "--enable-simple-lb") {
+			opts.explicit_lb_flags = true;
+			opts.enable_simple_lb = true;
 			continue;
 		}
-		if (arg == "--decomp2") {
-			opts.use_decomposition2 = true;
+		if (arg == "--disable-simple-lb") {
+			opts.explicit_lb_flags = true;
+			opts.enable_simple_lb = false;
 			continue;
 		}
-		if (arg == "--no-lawler-filter") {
-			opts.use_lawler_position_filter = false;
+		if (arg == "--enable-lb-memo") {
+			opts.explicit_lb_flags = true;
+			opts.enable_lb_memo = true;
 			continue;
 		}
-		if (arg == "--lawler-filter") {
-			opts.use_lawler_position_filter = true;
+		if (arg == "--disable-lb-memo") {
+			opts.explicit_lb_flags = true;
+			opts.enable_lb_memo = false;
 			continue;
 		}
-		if (arg == "--lawler-rule12") {
-			opts.use_lawler_rule12 = true;
+		if (arg == "--no-ub") {
+			opts.use_upper_bounds = false;
+			opts.explicit_ub_flags = false;
+			opts.enable_edd_ub = false;
 			continue;
 		}
-		if (arg == "--no-lawler-rule12") {
-			opts.use_lawler_rule12 = false;
+		if (arg == "--use-ub") {
+			opts.use_upper_bounds = true;
+			opts.explicit_ub_flags = false;
+			continue;
+		}
+		if (arg == "--enable-edd-ub") {
+			opts.explicit_ub_flags = true;
+			opts.enable_edd_ub = true;
+			continue;
+		}
+		if (arg == "--disable-edd-ub") {
+			opts.explicit_ub_flags = true;
+			opts.enable_edd_ub = false;
+			continue;
+		}
+		if (arg == "--terminal-rules") {
+			opts.use_terminal_rules = true;
+			opts.enable_terminal_all_tardy_spt = true;
+			opts.enable_terminal_edd_at_most_one_tardy = true;
+			continue;
+		}
+		if (arg == "--no-terminal-rules") {
+			opts.use_terminal_rules = false;
+			opts.enable_terminal_all_tardy_spt = false;
+			opts.enable_terminal_edd_at_most_one_tardy = false;
+			continue;
+		}
+		if (arg == "--enable-terminal-all-tardy-spt") {
+			opts.use_terminal_rules = true;
+			opts.enable_terminal_all_tardy_spt = true;
+			continue;
+		}
+		if (arg == "--disable-terminal-all-tardy-spt") {
+			opts.enable_terminal_all_tardy_spt = false;
+			continue;
+		}
+		if (arg == "--enable-terminal-edd-at-most-one-tardy") {
+			opts.use_terminal_rules = true;
+			opts.enable_terminal_edd_at_most_one_tardy = true;
+			continue;
+		}
+		if (arg == "--disable-terminal-edd-at-most-one-tardy") {
+			opts.enable_terminal_edd_at_most_one_tardy = false;
+			continue;
+		}
+		if (arg == "--enable-position-filtering") {
+			opts.position_filtering_enabled = true;
+			continue;
+		}
+		if (arg == "--disable-position-filtering") {
+			opts.position_filtering_enabled = false;
+			continue;
+		}
+		if (arg == "--enable-lawler-basic-rules") {
+			opts.position_filtering_enabled = true;
+			opts.enable_lawler_basic_rules = true;
+			continue;
+		}
+		if (arg == "--disable-lawler-basic-rules") {
+			opts.enable_lawler_basic_rules = false;
+			continue;
+		}
+		if (arg == "--enable-rule4") {
+			opts.enable_rule4 = true;
+			continue;
+		}
+		if (arg == "--disable-rule4") {
+			opts.enable_rule4 = false;
 			continue;
 		}
 		if (arg == "--process-memory-gate") {
 			opts.use_process_memory_gate = true;
 			continue;
 		}
-		if (arg == "--double-lb-prune") {
-			opts.use_double_pair_lb_prune = true;
+		if (arg == "--enable-memo") {
+			opts.enable_memo = true;
 			continue;
 		}
-		if (arg == "--no-double-lb-prune") {
-			opts.use_double_pair_lb_prune = false;
+		if (arg == "--disable-memo") {
+			opts.enable_memo = false;
 			continue;
 		}
-		if (arg == "--lufo-protect-exact") {
-			opts.use_lufo_exact_protect = true;
+		if (arg == "--enable-exact-memo") {
+			opts.enable_exact_memo = true;
 			continue;
 		}
-		if (arg == "--no-lufo-protect-exact") {
-			opts.use_lufo_exact_protect = false;
+		if (arg == "--disable-exact-memo") {
+			opts.enable_exact_memo = false;
+			continue;
+		}
+		if (arg == "--memo-full-key-verification") {
+			opts.memo_full_key_verification = true;
+			continue;
+		}
+		if (arg == "--no-memo-full-key-verification") {
+			opts.memo_full_key_verification = false;
 			continue;
 		}
 		if (arg == "--profiling") {
@@ -377,11 +572,17 @@ bool parse_cli(int argc, char** argv, cli_options& opts, std::string& error, boo
 		if (arg == "--profile-article") {
 			opts.due_range = 0.2;
 			opts.due_tardiness = 0.6;
+			opts.use_upper_bounds = false;
 			opts.use_lower_bounds = false;
-			opts.use_decomposition2 = true;
-			opts.use_lawler_position_filter = true;
-			opts.use_lawler_rule12 = false;
-			opts.decomp_policy = decomposition_policy::adaptive;
+			opts.explicit_lb_flags = false;
+			opts.explicit_ub_flags = false;
+			opts.enable_simple_lb = false;
+			opts.enable_lb_memo = false;
+			opts.enable_edd_ub = false;
+			opts.position_filtering_enabled = true;
+			opts.enable_lawler_basic_rules = true;
+			opts.enable_rule4 = true;
+			opts.decomposition_mode = DecompositionMode::Adaptive;
 			opts.memo_capacity = 0;
 			continue;
 		}
@@ -476,15 +677,51 @@ bool parse_cli(int argc, char** argv, cli_options& opts, std::string& error, boo
 				return false;
 			}
 		}
+		else if (arg == "--memo-backend") {
+			if (!parse_memo_backend_kind(value, opts.memo_backend)) {
+				error = "Invalid value for --memo-backend (expected custom|std_unordered).";
+				return false;
+			}
+		}
 		else if (arg == "--mem-budget-mb") {
 			if (!parse_size_arg(value, opts.mem_budget_mb)) {
 				error = "Invalid value for --mem-budget-mb.";
 				return false;
 			}
 		}
-		else if (arg == "--decomp-policy") {
-			if (!parse_decomposition_policy(value, opts.decomp_policy)) {
-				error = "Invalid value for --decomp-policy (expected adaptive|lawler|szwarc|both).";
+		else if (arg == "--ub-depth-limit") {
+			if (!parse_int_arg(value, opts.ub_depth_limit)) {
+				error = "Invalid value for --ub-depth-limit.";
+				return false;
+			}
+		}
+		else if (arg == "--lb-depth-limit") {
+			if (!parse_int_arg(value, opts.lb_depth_limit)) {
+				error = "Invalid value for --lb-depth-limit.";
+				return false;
+			}
+		}
+		else if (arg == "--model") {
+			if (!apply_model_name(value, opts)) {
+				error = "Invalid value for --model.";
+				return false;
+			}
+		}
+		else if (arg == "--preset") {
+			if (!apply_preset_name(value, opts)) {
+				error = "Invalid value for --preset.";
+				return false;
+			}
+		}
+		else if (arg == "--decomposition") {
+			if (!parse_decomposition_mode(value, opts.decomposition_mode)) {
+				error = "Invalid value for --decomposition.";
+				return false;
+			}
+		}
+		else if (arg == "--adaptive-policy") {
+			if (!parse_adaptive_policy_kind(value, opts.adaptive_policy)) {
+				error = "Invalid value for --adaptive-policy.";
 				return false;
 			}
 		}
@@ -579,20 +816,82 @@ std::string csv_escape(const std::string& text) {
 	return out;
 }
 
+std::string format_order_zero_based(const std::vector<job_id_t>& order) {
+	std::ostringstream out;
+	for (std::size_t i = 0; i < order.size(); ++i) {
+		if (i > 0) {
+			out << ' ';
+		}
+		out << order[i];
+	}
+	return out.str();
+}
+
+bool option_simple_lb_enabled(const cli_options& opts) {
+	return opts.explicit_lb_flags ? opts.enable_simple_lb : opts.use_lower_bounds;
+}
+
+bool option_lb_memo_enabled(const cli_options& opts) {
+	return opts.explicit_lb_flags ? opts.enable_lb_memo : opts.use_lower_bounds;
+}
+
+bool option_edd_ub_enabled(const cli_options& opts) {
+	return opts.explicit_ub_flags ? opts.enable_edd_ub : opts.use_upper_bounds;
+}
+
+bool option_any_ub_enabled(const cli_options& opts) {
+	return option_edd_ub_enabled(opts);
+}
+
+bool option_any_lb_enabled(const cli_options& opts) {
+	return option_simple_lb_enabled(opts) || option_lb_memo_enabled(opts);
+}
+
+void write_run_config_fields(std::ostream& out, const cli_options& opts) {
+	out
+		<< "," << (opts.position_filtering_enabled ? 1 : 0)
+		<< "," << (opts.enable_lawler_basic_rules ? 1 : 0)
+		<< "," << (option_simple_lb_enabled(opts) ? 1 : 0)
+		<< "," << (option_lb_memo_enabled(opts) ? 1 : 0)
+		<< "," << (option_edd_ub_enabled(opts) ? 1 : 0)
+		<< "," << opts.ub_depth_limit
+		<< "," << opts.lb_depth_limit
+		<< "," << (opts.enable_terminal_all_tardy_spt ? 1 : 0)
+		<< "," << (opts.enable_terminal_edd_at_most_one_tardy ? 1 : 0)
+		<< "," << (opts.enable_memo ? 1 : 0)
+		<< "," << (opts.enable_exact_memo ? 1 : 0)
+		<< "," << (opts.memo_full_key_verification ? 1 : 0)
+		<< "," << opts.mem_budget_mb
+		<< "," << to_string(opts.adaptive_policy)
+		;
+}
+
 dfs_config make_solver_config(const cli_options& opts) {
 	dfs_config cfg{};
-	cfg.memo_capacity = opts.memo_capacity;
-	cfg.memo_memory_budget_bytes = opts.mem_budget_mb * static_cast<std::size_t>(1024) * static_cast<std::size_t>(1024);
+	cfg.memo.capacity = opts.memo_capacity;
+	cfg.memo.memory_limit_bytes = opts.mem_budget_mb * static_cast<std::size_t>(1024) * static_cast<std::size_t>(1024);
 	cfg.reconstruct_order = opts.reconstruct_order;
-	cfg.strict_memory_cap = true;
-	cfg.use_lower_bounds = opts.use_lower_bounds;
-	cfg.use_decomposition2 = opts.use_decomposition2;
-	cfg.use_lawler_position_filter = opts.use_lawler_position_filter;
-	cfg.use_lawler_rule12 = opts.use_lawler_rule12;
-	cfg.use_process_memory_gate = opts.use_process_memory_gate;
-	cfg.use_double_pair_lb_prune = opts.use_double_pair_lb_prune;
-	cfg.use_lufo_exact_protection = opts.use_lufo_exact_protect;
-	cfg.decomp_policy = opts.decomp_policy;
+	cfg.bounds.enable_simple_lb = option_simple_lb_enabled(opts);
+	cfg.bounds.enable_lb_memo = option_lb_memo_enabled(opts);
+	cfg.bounds.enable_edd_ub = option_edd_ub_enabled(opts);
+	cfg.bounds.ub_depth_limit = opts.ub_depth_limit;
+	cfg.bounds.lb_depth_limit = opts.lb_depth_limit;
+	cfg.terminal_rules.enable_all_tardy_spt =
+		opts.use_terminal_rules && opts.enable_terminal_all_tardy_spt;
+	cfg.terminal_rules.enable_edd_at_most_one_tardy =
+		opts.use_terminal_rules && opts.enable_terminal_edd_at_most_one_tardy;
+	cfg.position_filtering.enabled = opts.position_filtering_enabled;
+	cfg.position_filtering.enable_lawler_basic_rules = opts.enable_lawler_basic_rules;
+	cfg.position_filtering.enable_rule4 = opts.enable_rule4;
+	cfg.memo.enable_memo = opts.enable_memo;
+	cfg.memo.enable_exact_memo = opts.enable_exact_memo;
+	cfg.memo.enable_lb_memo = option_lb_memo_enabled(opts);
+	cfg.memo.full_key_verification = opts.memo_full_key_verification;
+	cfg.memo.strict_memory_cap = true;
+	cfg.memo.use_process_memory_gate = opts.use_process_memory_gate;
+	cfg.memo.backend = opts.memo_backend;
+	cfg.decomposition_mode = opts.decomposition_mode;
+	cfg.adaptive_policy = opts.adaptive_policy;
 	cfg.profiling.enabled = opts.profiling_enabled;
 	return cfg;
 }
@@ -602,12 +901,27 @@ void write_csv_header(std::ofstream& out) {
 		<< "status,error"
 		<< ",n,instance_idx,seed,memo_capacity,mem_budget_mb"
 		<< ",p_min,p_max,due_range,due_tardiness,reconstruct_order"
-		<< ",use_lb,use_decomp2,use_lawler_filter,process_memory_gate,decomp_policy"
+		<< ",use_ub,use_lb,use_terminal_rules,enable_rule4,process_memory_gate,decomposition_mode,model_name,active_components"
+		<< ",position_filtering_enabled,enable_lawler_basic_rules"
+		<< ",enable_simple_lb,enable_lb_memo,enable_edd_ub,ub_depth_limit,lb_depth_limit"
+		<< ",enable_terminal_all_tardy_spt,enable_terminal_edd_at_most_one_tardy"
+		<< ",enable_memo,enable_exact_memo,memo_full_key_verification,memo_memory_limit_mb"
+		<< ",adaptive_policy"
 		<< ",cost,time_ms,nodes,leaves,pruned_by_bound,pruned_by_memo_exact,pruned_by_memo_lb"
 		<< ",max_depth,ordering_scans,ordering_sorts,valid_positions_built,valid_positions_pruned_3a,valid_positions_pruned_3b"
-		<< ",memo_hits,memo_misses,memo_inserts,memo_updates,memo_evictions,memo_rejected_no_room,memo_forced_evictions"
+		<< ",candidate_positions_before,candidate_positions_after,positions_pruned_by_lawler_basic"
+		<< ",positions_pruned_by_lawler_rule4,positions_pruned_by_szwarc_rule4"
+		<< ",time_spent_in_position_filtering_ms"
+		<< ",memo_hits,memo_misses,memo_exact_queries,memo_exact_hits,memo_lb_queries,memo_lb_hits,memo_inserts,memo_updates,memo_evictions,memo_evictions_exact,memo_evictions_lb,memo_rejected_no_room,memo_forced_evictions"
+		<< ",adaptive_policy_used"
+		<< ",memo_stores_exact,memo_stores_lb,cleanup_time_ms"
+		<< ",adaptive_v1_choices_lawler,adaptive_v1_choices_szwarc,adaptive_v1_choices_both"
+		<< ",adaptive_v2_choices_lawler,adaptive_v2_choices_szwarc,adaptive_v2_choices_both"
+		<< ",adaptive_v3_choices_lawler,adaptive_v3_choices_szwarc,adaptive_v3_choices_both"
+		<< ",adaptive_choice_lawler,adaptive_choice_szwarc"
 		<< ",memo_clean_calls,memo_lufo_decay_passes"
 		<< ",duplicate_subproblem_hits,hash_collisions,full_key_rechecks"
+		<< ",terminal_all_tardy_spt_hits,terminal_edd_one_tardy_hits,upper_bound_time_ms,terminal_time_ms"
 		<< ",memo_peak_size,memo_final_size,memo_used_bytes,memo_budget_bytes"
 		<< ",bound_time_ms,ordering_time_ms,valid_positions_time_ms,memo_lookup_time_ms,memo_store_time_ms,memo_clean_time_ms,order_size"
 		<< "\n";
@@ -627,12 +941,16 @@ void write_csv_error_row(std::ofstream& out, const cli_options& opts, int n, int
 		<< "," << opts.due_range
 		<< "," << opts.due_tardiness
 		<< "," << (opts.reconstruct_order ? 1 : 0)
-		<< "," << (opts.use_lower_bounds ? 1 : 0)
-		<< "," << (opts.use_decomposition2 ? 1 : 0)
-		<< "," << (opts.use_lawler_position_filter ? 1 : 0)
+		<< "," << (option_any_ub_enabled(opts) ? 1 : 0)
+		<< "," << (option_any_lb_enabled(opts) ? 1 : 0)
+		<< "," << (opts.use_terminal_rules ? 1 : 0)
+		<< "," << (opts.enable_rule4 ? 1 : 0)
 		<< "," << (opts.use_process_memory_gate ? 1 : 0)
-		<< "," << to_string(opts.decomp_policy);
-	for (int i = 0; i < 36; ++i) {
+		<< "," << to_string(opts.decomposition_mode)
+		<< "," << model_name_text(opts)
+		<< "," << csv_escape(active_components_text(opts));
+	write_run_config_fields(out, opts);
+	for (int i = 0; i < 63; ++i) {
 		out << ",0";
 	}
 	out << "\n";
@@ -653,11 +971,16 @@ void write_csv_ok_row(std::ofstream& out, const cli_options& opts, int n, int in
 		<< "," << opts.due_range
 		<< "," << opts.due_tardiness
 		<< "," << (opts.reconstruct_order ? 1 : 0)
-		<< "," << (opts.use_lower_bounds ? 1 : 0)
-		<< "," << (opts.use_decomposition2 ? 1 : 0)
-		<< "," << (opts.use_lawler_position_filter ? 1 : 0)
+		<< "," << (option_any_ub_enabled(opts) ? 1 : 0)
+		<< "," << (option_any_lb_enabled(opts) ? 1 : 0)
+		<< "," << (opts.use_terminal_rules ? 1 : 0)
+		<< "," << (opts.enable_rule4 ? 1 : 0)
 		<< "," << (opts.use_process_memory_gate ? 1 : 0)
-		<< "," << to_string(opts.decomp_policy)
+		<< "," << to_string(opts.decomposition_mode)
+		<< "," << model_name_text(opts)
+		<< "," << csv_escape(active_components_text(opts));
+	write_run_config_fields(out, opts);
+	out
 		<< "," << result.best.cost
 		<< "," << result.stats.elapsed_ms
 		<< "," << result.stats.nodes
@@ -671,18 +994,49 @@ void write_csv_ok_row(std::ofstream& out, const cli_options& opts, int n, int in
 		<< "," << result.stats.valid_positions_built
 		<< "," << result.stats.valid_positions_pruned_3a
 		<< "," << result.stats.valid_positions_pruned_3b
+		<< "," << result.stats.candidate_positions_before
+		<< "," << result.stats.candidate_positions_after
+		<< "," << result.stats.positions_pruned_by_lawler_basic
+		<< "," << result.stats.positions_pruned_by_lawler_rule4
+		<< "," << result.stats.positions_pruned_by_szwarc_rule4
+		<< "," << result.stats.time_spent_in_position_filtering_ms
 		<< "," << result.stats.memo_hits
 		<< "," << result.stats.memo_misses
+		<< "," << result.stats.memo_exact_queries
+		<< "," << result.stats.memo_exact_hits
+		<< "," << result.stats.memo_lb_queries
+		<< "," << result.stats.memo_lb_hits
 		<< "," << result.stats.memo_inserts
 		<< "," << result.stats.memo_updates
 		<< "," << result.stats.memo_evictions
+		<< "," << result.stats.memo_evictions_exact
+		<< "," << result.stats.memo_evictions_lb
 		<< "," << result.stats.memo_rejected_no_room
 		<< "," << result.stats.memo_forced_evictions
+		<< "," << result.stats.adaptive_policy_used
+		<< "," << result.stats.memo_stores_exact
+		<< "," << result.stats.memo_stores_lb
+		<< "," << result.stats.cleanup_time_ms
+		<< "," << result.stats.adaptive_v1_choices_lawler
+		<< "," << result.stats.adaptive_v1_choices_szwarc
+		<< "," << result.stats.adaptive_v1_choices_both
+		<< "," << result.stats.adaptive_v2_choices_lawler
+		<< "," << result.stats.adaptive_v2_choices_szwarc
+		<< "," << result.stats.adaptive_v2_choices_both
+		<< "," << result.stats.adaptive_v3_choices_lawler
+		<< "," << result.stats.adaptive_v3_choices_szwarc
+		<< "," << result.stats.adaptive_v3_choices_both
+		<< "," << result.stats.adaptive_choice_lawler
+		<< "," << result.stats.adaptive_choice_szwarc
 		<< "," << result.stats.memo_clean_calls
 		<< "," << result.stats.memo_lufo_decay_passes
 		<< "," << result.stats.duplicate_subproblem_hits
 		<< "," << result.stats.hash_collisions
 		<< "," << result.stats.full_key_rechecks
+		<< "," << result.stats.terminal_all_tardy_spt_hits
+		<< "," << result.stats.terminal_edd_one_tardy_hits
+		<< "," << result.stats.upper_bound_time_ms
+		<< "," << result.stats.terminal_time_ms
 		<< "," << result.stats.memo_peak_size
 		<< "," << result.stats.memo_final_size
 		<< "," << result.stats.memo_used_bytes
@@ -757,7 +1111,8 @@ bench_case_result execute_bench_case(
 			"[bench] start n=" + std::to_string(c.n) +
 			" instance=" + std::to_string(c.instance_idx) +
 			" seed=" + std::to_string(c.seed) +
-			" decomp=" + to_string(opts.decomp_policy));
+			" decomp=" + to_string(opts.decomposition_mode) +
+			" memo_backend=" + to_string(opts.memo_backend));
 
 		dfs_solver solver(make_solver_config(opts));
 		out.result = solver.solve(inst);
@@ -767,7 +1122,8 @@ bench_case_result execute_bench_case(
 			"[bench] done  n=" + std::to_string(c.n) +
 			" instance=" + std::to_string(c.instance_idx) +
 			" seed=" + std::to_string(c.seed) +
-			" decomp=" + to_string(opts.decomp_policy) +
+			" decomp=" + to_string(opts.decomposition_mode) +
+			" memo_backend=" + to_string(opts.memo_backend) +
 			" cost=" + std::to_string(out.result.best.cost) +
 			" time_ms=" + std::to_string(out.result.stats.elapsed_ms) +
 			" memo_rejected=" + std::to_string(out.result.stats.memo_rejected_no_room) +
@@ -782,7 +1138,7 @@ bench_case_result execute_bench_case(
 			"[bench] error n=" + std::to_string(c.n) +
 			" instance=" + std::to_string(c.instance_idx) +
 			" seed=" + std::to_string(c.seed) +
-			" decomp=" + to_string(opts.decomp_policy) +
+			" decomp=" + to_string(opts.decomposition_mode) +
 			" message=" + out.solve_error);
 	}
 
@@ -811,25 +1167,55 @@ bool run_single(const cli_options& opts) {
 		<< "[run] n=" << inst.jobs.size()
 		<< " seed=" << opts.seed
 		<< (!opts.input_path.empty() ? " input=" + opts.input_path : std::string{})
-		<< " decomp=" << to_string(opts.decomp_policy)
+		<< " decomp=" << to_string(opts.decomposition_mode)
+		<< " memo_backend=" << to_string(opts.memo_backend)
+		<< " use_ub=" << (option_any_ub_enabled(opts) ? 1 : 0)
+		<< " use_lb=" << (option_any_lb_enabled(opts) ? 1 : 0)
+		<< " terminal_rules=" << (opts.use_terminal_rules ? 1 : 0)
+		<< " position_filtering_enabled=" << (opts.position_filtering_enabled ? 1 : 0)
+		<< " enable_lawler_basic_rules=" << (opts.enable_lawler_basic_rules ? 1 : 0)
+		<< " enable_simple_lb=" << (option_simple_lb_enabled(opts) ? 1 : 0)
+		<< " enable_lb_memo=" << (option_lb_memo_enabled(opts) ? 1 : 0)
+		<< " enable_edd_ub=" << (option_edd_ub_enabled(opts) ? 1 : 0)
+		<< " ub_depth_limit=" << opts.ub_depth_limit
+		<< " lb_depth_limit=" << opts.lb_depth_limit
+		<< " terminal_all_tardy_spt=" << (opts.enable_terminal_all_tardy_spt ? 1 : 0)
+		<< " terminal_edd_at_most_one_tardy=" << (opts.enable_terminal_edd_at_most_one_tardy ? 1 : 0)
+		<< " enable_memo=" << (opts.enable_memo ? 1 : 0)
+		<< " enable_exact_memo=" << (opts.enable_exact_memo ? 1 : 0)
+		<< " memo_full_key_verification=" << (opts.memo_full_key_verification ? 1 : 0)
+		<< " memo_memory_limit_mb=" << opts.mem_budget_mb
 		<< " cost=" << result.best.cost
 		<< " time_ms=" << result.stats.elapsed_ms
 		<< " nodes=" << result.stats.nodes
 		<< " max_depth=" << result.stats.max_depth
 		<< " memo_hits=" << result.stats.memo_hits
 		<< " memo_misses=" << result.stats.memo_misses
-		<< " lawler_rule12=" << (opts.use_lawler_rule12 ? 1 : 0)
-		<< " double_lb_prune=" << (opts.use_double_pair_lb_prune ? 1 : 0)
-		<< " lufo_exact_protect=" << (opts.use_lufo_exact_protect ? 1 : 0)
-		<< " valid_pos=" << result.stats.valid_positions_built
-		<< " p3a=" << result.stats.valid_positions_pruned_3a
-		<< " p3b=" << result.stats.valid_positions_pruned_3b
+		<< " memo_exact_hits=" << result.stats.memo_exact_hits
+			<< " memo_lb_hits=" << result.stats.memo_lb_hits
+			<< " rule4=" << (opts.enable_rule4 ? 1 : 0)
+			<< " valid_pos=" << result.stats.valid_positions_built
+			<< " valid_pos_pruned_3a=" << result.stats.valid_positions_pruned_3a
+			<< " valid_pos_pruned_3b=" << result.stats.valid_positions_pruned_3b
 		<< " memo_rejected=" << result.stats.memo_rejected_no_room
 		<< " memo_forced_evict=" << result.stats.memo_forced_evictions
 		<< " lufo_passes=" << result.stats.memo_lufo_decay_passes
+		<< " terminal_spt=" << result.stats.terminal_all_tardy_spt_hits
+		<< " terminal_edd=" << result.stats.terminal_edd_one_tardy_hits
 		<< " memo_peak=" << result.stats.memo_peak_size
+		<< " memo_final=" << result.stats.memo_final_size
+		<< " memo_evictions=" << result.stats.memo_evictions
+		<< " memo_clean_time_ms=" << result.stats.memo_clean_time_ms
 		<< " memo_used_mb=" << (static_cast<double>(result.stats.memo_used_bytes) / (1024.0 * 1024.0))
+		<< " memo_bytes_per_entry="
+		<< (result.stats.memo_final_size == 0
+			? 0.0
+			: static_cast<double>(result.stats.memo_used_bytes) /
+				static_cast<double>(result.stats.memo_final_size))
 		<< "\n";
+	if (opts.reconstruct_order) {
+		std::cout << "[order0] " << format_order_zero_based(result.best.order) << "\n";
+	}
 	return true;
 }
 
@@ -852,7 +1238,7 @@ bool run_benchmark(const cli_options& opts, std::string& error) {
 	std::cout << "[bench] Writing results to: " << opts.bench_csv_path << "\n";
 	std::cout << "[bench] n-count=" << n_values.size()
 		<< " instances=" << opts.instances
-		<< " decomp=" << to_string(opts.decomp_policy)
+		<< " decomp=" << to_string(opts.decomposition_mode)
 		<< " threads=" << opts.bench_threads << "\n";
 	std::cout << "[bench] Press Ctrl+C to stop safely after current case.\n";
 
