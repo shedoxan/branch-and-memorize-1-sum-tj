@@ -1162,6 +1162,12 @@ bool run_single(const cli_options& opts) {
 
 	dfs_solver solver(cfg);
 	solve_result result = solver.solve(inst);
+	schedule_cost_t reconstructed_order_cost = 0;
+	bool reconstruction_success = !opts.reconstruct_order;
+	if (opts.reconstruct_order && !result.best.order.empty()) {
+		reconstructed_order_cost = evaluate_sum_tardiness(inst, result.best.order);
+		reconstruction_success = reconstructed_order_cost == result.best.cost;
+	}
 
 	std::cout
 		<< "[run] n=" << inst.jobs.size()
@@ -1186,6 +1192,8 @@ bool run_single(const cli_options& opts) {
 		<< " memo_full_key_verification=" << (opts.memo_full_key_verification ? 1 : 0)
 		<< " memo_memory_limit_mb=" << opts.mem_budget_mb
 		<< " cost=" << result.best.cost
+		<< " reconstruction_success=" << (reconstruction_success ? 1 : 0)
+		<< " reconstructed_order_cost=" << reconstructed_order_cost
 		<< " time_ms=" << result.stats.elapsed_ms
 		<< " nodes=" << result.stats.nodes
 		<< " max_depth=" << result.stats.max_depth

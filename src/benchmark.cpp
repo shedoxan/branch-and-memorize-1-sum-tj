@@ -120,6 +120,9 @@ struct benchmark_config {
 	std::string notes;
 	bool use_terminal_rules = true;
 	adaptive_policy_kind adaptive_policy = adaptive_policy_kind::v1;
+	bool enable_simple_lb = false;
+	bool enable_lb_memo = false;
+	bool enable_edd_ub = false;
 };
 
 // Одна строка будущего CSV: входные параметры, выбранный режим и метрики solver-а.
@@ -564,6 +567,7 @@ void print_usage() {
 		<< "Usage:\n"
 		<< "  solver_bench --series branching --out results/branching_modes_results.csv --time-limit-sec 3600\n"
 		<< "  solver_bench --series lower-bounds --decomposition adaptive --out results/lower_bounds_results.csv --time-limit-sec 3600\n"
+		<< "  solver_bench --series bounds-ablation --model adaptive_v3 --out results/bounds_ablation.csv --time-limit-sec 3600\n"
 		<< "  solver_bench --series memory --decomposition adaptive --out results/memory_results.csv --time-limit-sec 3600\n"
 		<< "  solver_bench --series hard --decomposition adaptive --hard-pairs auto --out results/hard_scaling_results.csv --time-limit-sec 12600\n\n"
 		<< "Options:\n"
@@ -846,6 +850,29 @@ std::vector<benchmark_config> make_series_configs(const benchmark_options& opts)
 		}
 		return configs;
 	}
+	if (opts.series == "bounds-ablation") {
+		std::vector<benchmark_config> configs = {
+			{ "baseline_bounds", opts.decomposition_mode, false, false, default_cap, "" },
+			{ "simple_lb", opts.decomposition_mode, false, false, default_cap, "" },
+			{ "simple_lb_lb_memo", opts.decomposition_mode, false, false, default_cap, "" },
+			{ "edd_ub", opts.decomposition_mode, false, false, default_cap, "" },
+			{ "simple_lb_edd_ub", opts.decomposition_mode, false, false, default_cap, "" },
+			{ "simple_lb_lb_memo_edd_ub", opts.decomposition_mode, false, false, default_cap, "" }
+		};
+		for (benchmark_config& config : configs) {
+			config.adaptive_policy = opts.adaptive_policy;
+		}
+		configs[1].enable_simple_lb = true;
+		configs[2].enable_simple_lb = true;
+		configs[2].enable_lb_memo = true;
+		configs[3].enable_edd_ub = true;
+		configs[4].enable_simple_lb = true;
+		configs[4].enable_edd_ub = true;
+		configs[5].enable_simple_lb = true;
+		configs[5].enable_lb_memo = true;
+		configs[5].enable_edd_ub = true;
+		return configs;
+	}
 	if (opts.series == "memory") {
 		// Проверяем чувствительность к лимиту числа memo entries.
 		std::vector<benchmark_config> configs = {
@@ -886,9 +913,12 @@ dfs_config make_solver_config(const benchmark_options& opts, const benchmark_con
 	cfg.zobrist_seed = 1;
 	cfg.time_limit_sec = opts.time_limit_sec;
 	cfg.reconstruct_order = false;
-	cfg.bounds.enable_simple_lb = config.use_lower_bounds;
-	cfg.bounds.enable_lb_memo = config.use_lower_bounds;
-	cfg.bounds.enable_edd_ub = config.use_upper_bounds;
+	const bool simple_lb_enabled = config.enable_simple_lb || config.use_lower_bounds;
+	const bool lb_memo_enabled = config.enable_lb_memo || config.use_lower_bounds;
+	const bool edd_ub_enabled = config.enable_edd_ub || config.use_upper_bounds;
+	cfg.bounds.enable_simple_lb = simple_lb_enabled;
+	cfg.bounds.enable_lb_memo = lb_memo_enabled;
+	cfg.bounds.enable_edd_ub = edd_ub_enabled;
 	cfg.bounds.ub_depth_limit = opts.ub_depth_limit;
 	cfg.bounds.lb_depth_limit = opts.lb_depth_limit;
 	cfg.terminal_rules.enable_all_tardy_spt =
@@ -901,7 +931,7 @@ dfs_config make_solver_config(const benchmark_options& opts, const benchmark_con
 	cfg.memo.use_process_memory_gate = cfg.memo.memory_limit_bytes > 0;
 	cfg.memo.enable_memo = opts.enable_memo;
 	cfg.memo.enable_exact_memo = opts.enable_exact_memo;
-	cfg.memo.enable_lb_memo = config.use_lower_bounds;
+	cfg.memo.enable_lb_memo = lb_memo_enabled;
 	cfg.memo.full_key_verification = opts.memo_full_key_verification;
 	cfg.memo.strict_memory_cap = true;
 	cfg.memo.backend = opts.memo_backend;
@@ -933,9 +963,9 @@ benchmark_row execute_case(const benchmark_options& opts, const benchmark_config
 	row.enable_rule4 = opts.enable_rule4;
 	row.position_filtering_enabled = opts.position_filtering_enabled;
 	row.enable_lawler_basic_rules = opts.enable_lawler_basic_rules;
-	row.enable_simple_lb = config.use_lower_bounds;
-	row.enable_lb_memo = config.use_lower_bounds;
-	row.enable_edd_ub = config.use_upper_bounds;
+	row.enable_simple_lb = config.enable_simple_lb || config.use_lower_bounds;
+	row.enable_lb_memo = config.enable_lb_memo || config.use_lower_bounds;
+	row.enable_edd_ub = config.enable_edd_ub || config.use_upper_bounds;
 	row.ub_depth_limit = opts.ub_depth_limit;
 	row.lb_depth_limit = opts.lb_depth_limit;
 	row.enable_terminal_all_tardy_spt = opts.enable_terminal_all_tardy_spt;
@@ -1573,6 +1603,7 @@ bool parse_cli(int argc, char** argv, benchmark_options& opts, std::string& erro
 	}
 
 	if (opts.series != "branching" && opts.series != "lower-bounds"
+		&& opts.series != "bounds-ablation"
 		&& opts.series != "memory" && opts.series != "hard") {
 		error = "Unknown --series: " + opts.series;
 		return false;
