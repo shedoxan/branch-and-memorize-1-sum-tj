@@ -64,9 +64,9 @@ def run_ctest(root: Path, dry_run: bool = False) -> None:
 
 def find_executable(root: Path, name: str) -> Path:
     candidates = [
-        root / "x64" / "Release" / name,
         root / "build" / "Release" / name,
         root / "build" / name,
+        root / "x64" / "Release" / name,
     ]
     for path in candidates:
         if path.exists():
@@ -114,4 +114,3 @@ def status_counts(rows: Iterable[dict[str, str]]) -> dict[str, int]:
         status = row.get("status", "")
         out[status] = out.get(status, 0) + 1
     return out
-

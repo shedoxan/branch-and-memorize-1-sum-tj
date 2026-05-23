@@ -107,6 +107,7 @@ def run_process(command, cwd: str | None, timeout_sec: int, shell: bool) -> tupl
         command,
         cwd=cwd,
         text=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         shell=shell,
@@ -337,8 +338,13 @@ def run_article(command_template: str, article_exe: str, article_config: str, in
 def write_summary(path: Path, rows: list[dict[str, str]]) -> None:
     ours_solved = sum(1 for row in rows if row["ours_reconstruct_status"] == "SOLVED")
     article_solved = sum(1 for row in rows if row["article_status"] == "SOLVED")
-    comparable = [row for row in rows if row["article_objective"]]
-    mismatches = sum(1 for row in comparable if row["objective_match"] != "true")
+    comparable = [
+        row for row in rows
+        if row.get("objective_comparison_status") in ("MATCH", "MISMATCH")
+    ]
+    mismatches = sum(1 for row in comparable if row["objective_comparison_status"] == "MISMATCH")
+    ours_oot = sum(1 for row in rows if row["ours_reconstruct_status"] == "OOT")
+    article_oot = sum(1 for row in rows if row["article_status"] == "OOT")
     ratios_reconstruct = [
         as_float(row["ratio_ours_reconstruct_wall_to_article"])
         for row in rows
@@ -352,6 +358,8 @@ def write_summary(path: Path, rows: list[dict[str, str]]) -> None:
         f.write("- ours_config: adaptive_v3 + custom memo + reconstruction + no process-memory gate\n")
         f.write(f"- ours_solved: {ours_solved}\n")
         f.write(f"- article_solved: {article_solved}\n")
+        f.write(f"- ours_oot: {ours_oot}\n")
+        f.write(f"- article_oot: {article_oot}\n")
         f.write(f"- comparable_rows: {len(comparable)}\n")
         f.write(f"- objective_mismatches: {mismatches}\n")
         if ratios_reconstruct:
@@ -399,13 +407,14 @@ def main() -> int:
         return 0
 
     kursovaya = find_executable(root, "kursovaya.exe")
+    print(f"[article] ours_exe={kursovaya}", flush=True)
     shared_work_dir = Path(args.shared_work_dir) if args.shared_work_dir else out_dir
     data_root = shared_work_dir / "data"
     memory_limit_mb = int(round(args.memory_limit_gb * 1024.0))
     article_config = prepare_article_config(args.article_exe, args.article_config, out_dir, memory_limit_mb)
     objective_regex = re.compile(args.article_objective_regex, re.IGNORECASE)
     fieldnames = [
-        "n", "R", "T", "seed", "instance_path", "shared_work_dir", "data_mode",
+        "n", "R", "T", "seed", "instance_path", "shared_work_dir", "data_mode", "ours_exe",
         "ours_reconstruct_status", "ours_reconstruct_objective",
         "ours_reconstruct_reported_time_ms", "ours_reconstruct_wall_time_ms",
         "ours_reconstruction_success", "ours_reconstructed_order_cost", "ours_order_length",
@@ -415,7 +424,7 @@ def main() -> int:
         "ratio_ours_reconstruct_wall_to_article",
         "ratio_ours_reconstruct_memo_to_article_memo",
         "ratio_ours_reconstruct_peak_to_article_peak",
-        "objective_match", "notes",
+        "objective_comparison_status", "objective_match", "notes",
     ]
     fieldnames.append("ours_reconstruct_run_line")
     for key in OUR_RUN_KEYS:
@@ -462,6 +471,23 @@ def main() -> int:
                             ours_reconstruct.get("process_peak_working_set_bytes", ""),
                             article.get("process_peak_working_set_bytes", ""),
                         )
+                        if (
+                            ours_reconstruct.get("status", "") == "SOLVED"
+                            and article.get("status", "") == "SOLVED"
+                            and ours_reconstruct.get("cost", "") != ""
+                            and article.get("objective", "") != ""
+                        ):
+                            objective_status = "MATCH" if objective_match else "MISMATCH"
+                            objective_match_text = "true" if objective_match else "false"
+                        elif ours_reconstruct.get("status", "") == "OOT":
+                            objective_status = "NOT_COMPARABLE_OURS_OOT"
+                            objective_match_text = ""
+                        elif article.get("status", "") == "OOT":
+                            objective_status = "NOT_COMPARABLE_ARTICLE_OOT"
+                            objective_match_text = ""
+                        else:
+                            objective_status = "NOT_COMPARABLE_ERROR"
+                            objective_match_text = ""
                         row = {
                             "n": str(n),
                             "R": fmt_float(r),
@@ -470,6 +496,7 @@ def main() -> int:
                             "instance_path": str(inst_for_run) if inst_for_run else "",
                             "shared_work_dir": str(shared_work_dir),
                             "data_mode": "generated_shared",
+                            "ours_exe": str(kursovaya),
                             "ours_reconstruct_status": ours_reconstruct.get("status", ""),
                             "ours_reconstruct_objective": ours_reconstruct.get("cost", ""),
                             "ours_reconstruct_reported_time_ms": ours_reconstruct.get("time_ms", ""),
@@ -488,7 +515,8 @@ def main() -> int:
                             "ratio_ours_reconstruct_wall_to_article": ratio_reconstruct,
                             "ratio_ours_reconstruct_memo_to_article_memo": ratio_memo,
                             "ratio_ours_reconstruct_peak_to_article_peak": ratio_peak,
-                            "objective_match": "true" if objective_match else "false",
+                            "objective_comparison_status": objective_status,
+                            "objective_match": objective_match_text,
                             "notes": notes or ours_reconstruct.get("error", "") or article.get("error", ""),
                         }
                         row["ours_reconstruct_run_line"] = ours_reconstruct.get("run_line", "")
