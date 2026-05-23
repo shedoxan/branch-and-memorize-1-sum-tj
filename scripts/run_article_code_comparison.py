@@ -37,6 +37,20 @@ def parse_run_line(stdout: str) -> dict[str, str]:
     return {}
 
 
+def order_length(stdout: str) -> int:
+    """Return the number of jobs printed in the reconstructed order."""
+    for line in stdout.splitlines():
+        if line.startswith("order:"):
+            body = line[len("order:"):].strip()
+            return 0 if not body else len(body.split())
+        if line.startswith("[order"):
+            close = line.find("]")
+            if close >= 0:
+                body = line[close + 1:].strip()
+                return 0 if not body else len(body.split())
+    return 0
+
+
 def instance_path(data_root: Path, n: int, r: float, t: float, seed: int, offset: int) -> Path:
     file_seed = seed + offset
     return data_root / str(n) / f"SDT_{n}_{fmt_float(r)}_{fmt_float(t)}_{file_seed}.txt"
@@ -57,7 +71,7 @@ def run_ours(kursovaya: Path, root: Path, n: int, r: float, t: float, seed: int,
         "--enable-rule4",
         "--no-lb",
         "--no-ub",
-        "--no-reconstruct",
+        "--reconstruct",
         "--mem-budget-mb", "12288",
     ]
     if input_path is not None:
@@ -76,6 +90,7 @@ def run_ours(kursovaya: Path, root: Path, n: int, r: float, t: float, seed: int,
         parsed = parse_run_line(completed.stdout)
         parsed["status"] = "SOLVED" if completed.returncode == 0 and parsed else "ERROR"
         parsed["wall_time_ms"] = f"{wall_ms:.3f}"
+        parsed["order_length"] = str(order_length(completed.stdout))
         parsed["error"] = "" if completed.returncode == 0 else completed.stderr.strip()
         return parsed
     except subprocess.TimeoutExpired:
@@ -120,6 +135,7 @@ def write_summary(path: Path, rows: list[dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         f.write("# Article Code Comparison Summary\n\n")
         f.write(f"- rows: {len(rows)}\n")
+        f.write("- ours_config: adaptive_v3 + custom memo + reconstruction + no process-memory gate\n")
         f.write(f"- ours_solved: {ours_solved}\n")
         f.write(f"- article_solved: {article_solved}\n")
         f.write(f"- comparable_rows: {len(comparable)}\n")
@@ -170,6 +186,7 @@ def main() -> int:
     fieldnames = [
         "n", "R", "T", "seed", "instance_path",
         "ours_status", "ours_objective", "ours_reported_time_ms", "ours_wall_time_ms",
+        "ours_reconstruction_success", "ours_reconstructed_order_cost", "ours_order_length",
         "article_status", "article_objective", "article_wall_time_ms",
         "objective_match", "notes",
     ]
@@ -216,6 +233,9 @@ def main() -> int:
                             "ours_objective": ours.get("cost", ""),
                             "ours_reported_time_ms": ours.get("time_ms", ""),
                             "ours_wall_time_ms": ours.get("wall_time_ms", ""),
+                            "ours_reconstruction_success": ours.get("reconstruction_success", ""),
+                            "ours_reconstructed_order_cost": ours.get("reconstructed_order_cost", ""),
+                            "ours_order_length": ours.get("order_length", ""),
                             "article_status": article.get("status", ""),
                             "article_objective": article.get("objective", ""),
                             "article_wall_time_ms": article.get("wall_time_ms", ""),
