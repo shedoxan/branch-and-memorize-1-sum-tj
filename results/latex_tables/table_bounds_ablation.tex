@@ -1,0 +1,11 @@
+\begin{tabular}{llllllll}
+\toprule
+режим & оптимум & медианное время & p90 времени & медиана узлов & доля времени bounds & доля LB-hit & решение \\
+\midrule
+edd\_ub & match & 1.03x & 1.06x & 1.00x & 0.0\% & -- & nodes\_down\_time\_up \\
+simple\_lb & match & 1.42x & 1.57x & 1.00x & 12.9\% & -- & nodes\_down\_time\_up \\
+simple\_lb\_edd\_ub & match & 1.47x & 1.62x & 0.99x & 12.6\% & -- & nodes\_down\_time\_up \\
+simple\_lb\_lb\_memo & match & 1.46x & 1.60x & 1.00x & 13.4\% & 0.0\% & nodes\_down\_time\_up \\
+simple\_lb\_lb\_memo\_edd\_ub & match & 1.50x & 1.63x & 0.99x & 13.1\% & 0.0\% & nodes\_down\_time\_up \\
+\bottomrule
+\end{tabular}

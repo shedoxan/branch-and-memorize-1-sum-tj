@@ -100,6 +100,7 @@ struct std_unordered_memo_entry {
 	long long lower_bound_value = 0;
 	/// Первая работа оптимального продолжения. Имеет смысл только при has_exact.
 	int best_job = -1;
+	memo_reconstruction_trace reconstruction_trace{};
 	/// Простейший счётчик обращений для reference eviction.
 	std::int16_t use_count = 0;
 	/// Есть ли точное значение OPT(S,t).
@@ -193,6 +194,7 @@ public:
 		result.exact = it->second.exact_value;
 		result.lower_bound = it->second.exact_value;
 		result.best_job = it->second.best_job;
+		result.reconstruction_trace = it->second.reconstruction_trace;
 		return result;
 	}
 
@@ -217,6 +219,9 @@ public:
 		result.exact = it->second.has_exact ? it->second.exact_value : 0;
 		result.lower_bound = it->second.has_exact ? it->second.exact_value : it->second.lower_bound_value;
 		result.best_job = it->second.has_exact ? it->second.best_job : -1;
+		if (it->second.has_exact) {
+			result.reconstruction_trace = it->second.reconstruction_trace;
+		}
 		return result;
 	}
 
@@ -244,6 +249,9 @@ public:
 		result.exact = it->second.has_exact ? it->second.exact_value : 0;
 		result.lower_bound = it->second.has_exact ? it->second.exact_value : it->second.lower_bound_value;
 		result.best_job = it->second.has_exact ? it->second.best_job : -1;
+		if (it->second.has_exact) {
+			result.reconstruction_trace = it->second.reconstruction_trace;
+		}
 		return result;
 	}
 
@@ -289,6 +297,26 @@ public:
 	}
 
 	/// Короткий alias для общего memo API.
+	bool store_reconstruction_trace(const std::vector<std::uint64_t>& bits, schedule_time_t time,
+		std::uint64_t subset_hash, std::uint64_t subset_fingerprint,
+		const memo_reconstruction_trace& trace, bool = true) {
+		(void)subset_hash;
+		(void)subset_fingerprint;
+		if (!trace.has_trace) {
+			return false;
+		}
+		auto it = find_entry(bits, time);
+		if (it == table_.end() || !it->second.has_exact) {
+			return false;
+		}
+		if (!it->second.reconstruction_trace.has_trace) {
+			++stats_.reconstruction_trace_entries;
+		}
+		it->second.reconstruction_trace = trace;
+		touch_entry(it->second);
+		return true;
+	}
+
 	void store_lb(const std::vector<std::uint64_t>& bits, schedule_time_t time,
 		std::uint64_t subset_hash, std::uint64_t subset_fingerprint,
 		long long lb, bool count_stats = true) {
@@ -466,7 +494,8 @@ private:
 			const bool it_lb_only = !it->second.has_exact;
 			const bool victim_lb_only = !victim->second.has_exact;
 			if ((it_lb_only && !victim_lb_only) ||
-				(it_lb_only == victim_lb_only && it->second.use_count < victim->second.use_count)) {
+				(it_lb_only == victim_lb_only &&
+					it->second.use_count < victim->second.use_count)) {
 				victim = it;
 			}
 		}
@@ -474,11 +503,15 @@ private:
 			return false;
 		}
 		const bool evicted_exact = victim->second.has_exact;
+		const bool evicted_trace = victim->second.reconstruction_trace.has_trace;
 		if (memory_.used_bytes >= victim->second.estimated_bytes) {
 			memory_.used_bytes -= victim->second.estimated_bytes;
 		}
 		else {
 			memory_.used_bytes = 0;
+		}
+		if (evicted_trace && stats_.reconstruction_trace_entries > 0) {
+			--stats_.reconstruction_trace_entries;
 		}
 		table_.erase(victim);
 		if (count_stats) {

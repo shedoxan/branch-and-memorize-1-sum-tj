@@ -111,7 +111,12 @@ private:
 		const std::vector<int>& jobs, int* first_job, bool track_stats);
 	/// Восстанавливает оптимальный порядок по exact memo-записям и полю best_job.
 	std::vector<job_id_t> reconstruct_order(long long optimal_cost);
-
+	bool append_order_by_trace(schedule_time_t current_time, long long exact, std::vector<job_id_t>& order);
+	bool append_order_linearly(schedule_time_t current_time, long long exact, std::vector<job_id_t>& order);
+	bool append_terminal_order(schedule_time_t current_time, long long exact, std::vector<job_id_t>& order);
+	void store_reconstruction_trace(schedule_time_t current_time,
+		const memo_reconstruction_trace& trace,
+		bool track_stats);
 	/// Таблица памяти M ключуется полной подзадачей (S,t), а не только S.
 	/// Для одной и той же S разные t дают разные C_j и, значит, разные T_j.
 	memo_lookup_result query_memo(schedule_time_t current_time, bool track_stats);

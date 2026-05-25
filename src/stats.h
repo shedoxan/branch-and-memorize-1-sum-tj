@@ -168,8 +168,23 @@ struct solver_stats {
 	/// Бюджет памяти M, если он задан.
 	std::size_t memo_budget_bytes = 0;
 
+	std::uint64_t reconstruction_steps = 0;
+	std::uint64_t reconstruction_current_exact_hits = 0;
+	std::uint64_t reconstruction_current_exact_misses = 0;
+	std::uint64_t reconstruction_child_exact_hits = 0;
+	std::uint64_t reconstruction_child_exact_misses = 0;
+	std::uint64_t reconstruction_repair_solves = 0;
+	std::uint64_t reconstruction_candidate_scans = 0;
+	std::uint64_t reconstruction_trace_stores = 0;
+	std::uint64_t reconstruction_trace_entries = 0;
+	std::uint64_t reconstruction_trace_hits = 0;
+	std::uint64_t reconstruction_trace_misses = 0;
+	std::uint64_t reconstruction_trace_terminal_hits = 0;
+	std::uint64_t reconstruction_trace_fallbacks = 0;
+
 	/// Полное время решения.
 	double elapsed_ms = 0.0;
+	double reconstruction_time_ms = 0.0;
 	/// Время вычисления lower bounds.
 	double bound_time_ms = 0.0;
 	/// Время построения heuristic UB.

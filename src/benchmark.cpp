@@ -49,13 +49,16 @@ struct run_key {
 
 	std::string str() const {
 		return series + "|" + config + "|" + std::to_string(n) + "|" + r + "|" + t + "|" + std::to_string(seed)
-			+ "|" + rule4 + "|" + terminal_rules + "|" + memo_backend + "|" + adaptive_policy;
+			+ "|" + rule4 + "|" + terminal_rules + "|" + memo_backend + "|" + adaptive_policy
+			+ "|" + reconstruct_order + "|" + reconstruction_trace;
 	}
 
 	std::string rule4 = "true";
 	std::string terminal_rules = "true";
 	std::string memo_backend = "custom";
 	std::string adaptive_policy = "v1";
+	std::string reconstruct_order = "false";
+	std::string reconstruction_trace = "false";
 };
 
 // Общие параметры запуска benchmark-а.
@@ -99,6 +102,9 @@ struct benchmark_options {
 	bool enable_memo = true;
 	bool enable_exact_memo = true;
 	bool memo_full_key_verification = true;
+	bool use_process_memory_gate = true;
+	bool reconstruct_order = false;
+	bool reconstruction_trace = false;
 	memo_backend_kind memo_backend = memo_backend_kind::custom;
 	adaptive_policy_kind adaptive_policy = adaptive_policy_kind::v1;
 
@@ -120,9 +126,6 @@ struct benchmark_config {
 	std::string notes;
 	bool use_terminal_rules = true;
 	adaptive_policy_kind adaptive_policy = adaptive_policy_kind::v1;
-	bool enable_simple_lb = false;
-	bool enable_lb_memo = false;
-	bool enable_edd_ub = false;
 };
 
 // Одна строка будущего CSV: входные параметры, выбранный режим и метрики solver-а.
@@ -162,6 +165,8 @@ struct benchmark_row {
 	bool enable_memo = true;
 	bool enable_exact_memo = true;
 	bool memo_full_key_verification = true;
+	bool reconstruct_order = false;
+	bool reconstruction_trace = false;
 	adaptive_policy_kind adaptive_policy = adaptive_policy_kind::v1;
 	std::string notes;
 };
@@ -220,6 +225,8 @@ const std::vector<std::string> csv_header = {
 	"enable_memo",
 	"enable_exact_memo",
 	"memo_full_key_verification",
+	"reconstruct_order",
+	"reconstruction_trace",
 	"memo_capacity",
 	"memo_memory_limit_mb",
 	"memo_exact_queries",
@@ -238,6 +245,20 @@ const std::vector<std::string> csv_header = {
 	"memo_final_size",
 	"memo_rejected_no_room",
 	"memo_forced_evictions",
+	"reconstruction_time_ms",
+	"reconstruction_steps",
+	"reconstruction_current_exact_hits",
+	"reconstruction_current_exact_misses",
+	"reconstruction_child_exact_hits",
+	"reconstruction_child_exact_misses",
+	"reconstruction_repair_solves",
+	"reconstruction_candidate_scans",
+	"reconstruction_trace_stores",
+	"reconstruction_trace_entries",
+	"reconstruction_trace_hits",
+	"reconstruction_trace_misses",
+	"reconstruction_trace_terminal_hits",
+	"reconstruction_trace_fallbacks",
 	"simple_lb_calls",
 	"simple_lb_prunes",
 	"ub_calls",
@@ -567,7 +588,6 @@ void print_usage() {
 		<< "Usage:\n"
 		<< "  solver_bench --series branching --out results/branching_modes_results.csv --time-limit-sec 3600\n"
 		<< "  solver_bench --series lower-bounds --decomposition adaptive --out results/lower_bounds_results.csv --time-limit-sec 3600\n"
-		<< "  solver_bench --series bounds-ablation --model adaptive_v3 --out results/bounds_ablation.csv --time-limit-sec 3600\n"
 		<< "  solver_bench --series memory --decomposition adaptive --out results/memory_results.csv --time-limit-sec 3600\n"
 		<< "  solver_bench --series hard --decomposition adaptive --hard-pairs auto --out results/hard_scaling_results.csv --time-limit-sec 12600\n\n"
 		<< "Options:\n"
@@ -594,6 +614,9 @@ void print_usage() {
 		<< "  --enable-memo true|false        Toggle memoization globally (default true).\n"
 		<< "  --enable-exact-memo true|false  Toggle exact memo entries (default true).\n"
 		<< "  --memo-full-key-verification true|false Exact-safe memo key checking (default true).\n"
+		<< "  --process-memory-gate true|false Also cap memo by process working set (default true).\n"
+		<< "  --reconstruct true|false        Include order reconstruction in each run (default false).\n"
+		<< "  --reconstruction-trace true|false Use split trace for reconstruction (default false).\n"
 		<< "  --enable-position-filtering true|false Toggle all position filters.\n"
 		<< "  --enable-lawler-basic-rules true|false Toggle Lawler position rules.\n"
 		<< "  --ub-depth-limit <int>          Limit UB calls by recursion depth, -1 = unlimited.\n"
@@ -763,6 +786,9 @@ void write_metadata(const benchmark_options& opts) {
 	out << "enable_memo=" << (opts.enable_memo ? "true" : "false") << "\n";
 	out << "enable_exact_memo=" << (opts.enable_exact_memo ? "true" : "false") << "\n";
 	out << "memo_full_key_verification=" << (opts.memo_full_key_verification ? "true" : "false") << "\n";
+	out << "process_memory_gate=" << (opts.use_process_memory_gate ? "true" : "false") << "\n";
+	out << "reconstruct_order=" << (opts.reconstruct_order ? "true" : "false") << "\n";
+	out << "reconstruction_trace=" << (opts.reconstruction_trace ? "true" : "false") << "\n";
 	out << "model_name=" << model_name_text(opts.decomposition_mode, opts.adaptive_policy) << "\n";
 	out << "active_components=" << active_components_text(opts.decomposition_mode) << "\n";
 	out << "adaptive_policy=" << to_string(opts.adaptive_policy) << "\n";
@@ -850,29 +876,6 @@ std::vector<benchmark_config> make_series_configs(const benchmark_options& opts)
 		}
 		return configs;
 	}
-	if (opts.series == "bounds-ablation") {
-		std::vector<benchmark_config> configs = {
-			{ "baseline_bounds", opts.decomposition_mode, false, false, default_cap, "" },
-			{ "simple_lb", opts.decomposition_mode, false, false, default_cap, "" },
-			{ "simple_lb_lb_memo", opts.decomposition_mode, false, false, default_cap, "" },
-			{ "edd_ub", opts.decomposition_mode, false, false, default_cap, "" },
-			{ "simple_lb_edd_ub", opts.decomposition_mode, false, false, default_cap, "" },
-			{ "simple_lb_lb_memo_edd_ub", opts.decomposition_mode, false, false, default_cap, "" }
-		};
-		for (benchmark_config& config : configs) {
-			config.adaptive_policy = opts.adaptive_policy;
-		}
-		configs[1].enable_simple_lb = true;
-		configs[2].enable_simple_lb = true;
-		configs[2].enable_lb_memo = true;
-		configs[3].enable_edd_ub = true;
-		configs[4].enable_simple_lb = true;
-		configs[4].enable_edd_ub = true;
-		configs[5].enable_simple_lb = true;
-		configs[5].enable_lb_memo = true;
-		configs[5].enable_edd_ub = true;
-		return configs;
-	}
 	if (opts.series == "memory") {
 		// Проверяем чувствительность к лимиту числа memo entries.
 		std::vector<benchmark_config> configs = {
@@ -912,13 +915,11 @@ dfs_config make_solver_config(const benchmark_options& opts, const benchmark_con
 	cfg.memo.memory_limit_bytes = gb_to_bytes(opts.memory_limit_gb);
 	cfg.zobrist_seed = 1;
 	cfg.time_limit_sec = opts.time_limit_sec;
-	cfg.reconstruct_order = false;
-	const bool simple_lb_enabled = config.enable_simple_lb || config.use_lower_bounds;
-	const bool lb_memo_enabled = config.enable_lb_memo || config.use_lower_bounds;
-	const bool edd_ub_enabled = config.enable_edd_ub || config.use_upper_bounds;
-	cfg.bounds.enable_simple_lb = simple_lb_enabled;
-	cfg.bounds.enable_lb_memo = lb_memo_enabled;
-	cfg.bounds.enable_edd_ub = edd_ub_enabled;
+	cfg.reconstruct_order = opts.reconstruct_order;
+	cfg.reconstruction_trace = opts.reconstruction_trace;
+	cfg.bounds.enable_simple_lb = config.use_lower_bounds;
+	cfg.bounds.enable_lb_memo = config.use_lower_bounds;
+	cfg.bounds.enable_edd_ub = config.use_upper_bounds;
 	cfg.bounds.ub_depth_limit = opts.ub_depth_limit;
 	cfg.bounds.lb_depth_limit = opts.lb_depth_limit;
 	cfg.terminal_rules.enable_all_tardy_spt =
@@ -928,10 +929,11 @@ dfs_config make_solver_config(const benchmark_options& opts, const benchmark_con
 	cfg.position_filtering.enabled = opts.position_filtering_enabled;
 	cfg.position_filtering.enable_lawler_basic_rules = opts.enable_lawler_basic_rules;
 	cfg.position_filtering.enable_rule4 = opts.enable_rule4;
-	cfg.memo.use_process_memory_gate = cfg.memo.memory_limit_bytes > 0;
+	cfg.memo.use_process_memory_gate =
+		opts.use_process_memory_gate && cfg.memo.memory_limit_bytes > 0;
 	cfg.memo.enable_memo = opts.enable_memo;
 	cfg.memo.enable_exact_memo = opts.enable_exact_memo;
-	cfg.memo.enable_lb_memo = lb_memo_enabled;
+	cfg.memo.enable_lb_memo = config.use_lower_bounds;
 	cfg.memo.full_key_verification = opts.memo_full_key_verification;
 	cfg.memo.strict_memory_cap = true;
 	cfg.memo.backend = opts.memo_backend;
@@ -963,9 +965,9 @@ benchmark_row execute_case(const benchmark_options& opts, const benchmark_config
 	row.enable_rule4 = opts.enable_rule4;
 	row.position_filtering_enabled = opts.position_filtering_enabled;
 	row.enable_lawler_basic_rules = opts.enable_lawler_basic_rules;
-	row.enable_simple_lb = config.enable_simple_lb || config.use_lower_bounds;
-	row.enable_lb_memo = config.enable_lb_memo || config.use_lower_bounds;
-	row.enable_edd_ub = config.enable_edd_ub || config.use_upper_bounds;
+	row.enable_simple_lb = config.use_lower_bounds;
+	row.enable_lb_memo = config.use_lower_bounds;
+	row.enable_edd_ub = config.use_upper_bounds;
 	row.ub_depth_limit = opts.ub_depth_limit;
 	row.lb_depth_limit = opts.lb_depth_limit;
 	row.enable_terminal_all_tardy_spt = opts.enable_terminal_all_tardy_spt;
@@ -973,6 +975,8 @@ benchmark_row execute_case(const benchmark_options& opts, const benchmark_config
 	row.enable_memo = opts.enable_memo;
 	row.enable_exact_memo = opts.enable_exact_memo;
 	row.memo_full_key_verification = opts.memo_full_key_verification;
+	row.reconstruct_order = opts.reconstruct_order;
+	row.reconstruction_trace = opts.reconstruction_trace;
 	row.adaptive_policy = config.adaptive_policy;
 	row.stats.adaptive_policy_used = static_cast<std::uint64_t>(config.adaptive_policy);
 	row.notes = config.notes;
@@ -992,6 +996,16 @@ benchmark_row execute_case(const benchmark_options& opts, const benchmark_config
 
 		dfs_solver solver(make_solver_config(opts, config));
 		const solve_result result = solver.solve(inst);
+		if (opts.reconstruct_order) {
+			if (result.best.order.size() != static_cast<std::size_t>(n)) {
+				throw std::runtime_error("reconstruction_failed: order size mismatch");
+			}
+			const schedule_cost_t reconstructed_cost =
+				evaluate_sum_tardiness(inst, result.best.order);
+			if (reconstructed_cost != result.best.cost) {
+				throw std::runtime_error("reconstruction_failed: order cost mismatch");
+			}
+		}
 		row.status = "SOLVED";
 		row.optimum = std::to_string(result.best.cost);
 		row.time_ms = result.stats.elapsed_ms;
@@ -1094,6 +1108,8 @@ void write_row(std::ofstream& out, const benchmark_row& row) {
 	values["enable_memo"] = bool_text(row.enable_memo);
 	values["enable_exact_memo"] = bool_text(row.enable_exact_memo);
 	values["memo_full_key_verification"] = bool_text(row.memo_full_key_verification);
+	values["reconstruct_order"] = bool_text(row.reconstruct_order);
+	values["reconstruction_trace"] = bool_text(row.reconstruction_trace);
 	values["memo_capacity"] = std::to_string(row.memo_capacity);
 	values["memo_memory_limit_mb"] =
 		std::to_string(static_cast<std::uint64_t>(row.memory_limit_gb * 1024.0));
@@ -1113,6 +1129,32 @@ void write_row(std::ofstream& out, const benchmark_row& row) {
 	values["memo_final_size"] = std::to_string(row.stats.memo_final_size);
 	values["memo_rejected_no_room"] = uint_text(row.stats.memo_rejected_no_room);
 	values["memo_forced_evictions"] = uint_text(row.stats.memo_forced_evictions);
+	values["reconstruction_time_ms"] = format_double(row.stats.reconstruction_time_ms);
+	values["reconstruction_steps"] = uint_text(row.stats.reconstruction_steps);
+	values["reconstruction_current_exact_hits"] =
+		uint_text(row.stats.reconstruction_current_exact_hits);
+	values["reconstruction_current_exact_misses"] =
+		uint_text(row.stats.reconstruction_current_exact_misses);
+	values["reconstruction_child_exact_hits"] =
+		uint_text(row.stats.reconstruction_child_exact_hits);
+	values["reconstruction_child_exact_misses"] =
+		uint_text(row.stats.reconstruction_child_exact_misses);
+	values["reconstruction_repair_solves"] =
+		uint_text(row.stats.reconstruction_repair_solves);
+	values["reconstruction_candidate_scans"] =
+		uint_text(row.stats.reconstruction_candidate_scans);
+	values["reconstruction_trace_stores"] =
+		uint_text(row.stats.reconstruction_trace_stores);
+	values["reconstruction_trace_entries"] =
+		uint_text(row.stats.reconstruction_trace_entries);
+	values["reconstruction_trace_hits"] =
+		uint_text(row.stats.reconstruction_trace_hits);
+	values["reconstruction_trace_misses"] =
+		uint_text(row.stats.reconstruction_trace_misses);
+	values["reconstruction_trace_terminal_hits"] =
+		uint_text(row.stats.reconstruction_trace_terminal_hits);
+	values["reconstruction_trace_fallbacks"] =
+		uint_text(row.stats.reconstruction_trace_fallbacks);
 	values["simple_lb_calls"] = uint_text(row.stats.simple_lb_calls);
 	values["simple_lb_prunes"] = uint_text(row.stats.simple_lb_prunes);
 	values["ub_calls"] = uint_text(row.stats.ub_calls);
@@ -1202,6 +1244,10 @@ std::unordered_set<std::string> load_completed_keys(const fs::path& csv_path) {
 		key.memo_backend = (memo_backend_it == idx.end()) ? "custom" : lowercase_copy(fields[memo_backend_it->second]);
 		const auto adaptive_policy_it = idx.find("adaptive_policy");
 		key.adaptive_policy = (adaptive_policy_it == idx.end()) ? "v1" : lowercase_copy(fields[adaptive_policy_it->second]);
+		const auto reconstruct_it = idx.find("reconstruct_order");
+		key.reconstruct_order = (reconstruct_it == idx.end()) ? "false" : lowercase_copy(fields[reconstruct_it->second]);
+		const auto trace_it = idx.find("reconstruction_trace");
+		key.reconstruction_trace = (trace_it == idx.end()) ? "false" : lowercase_copy(fields[trace_it->second]);
 		keys.insert(key.str());
 	}
 	return keys;
@@ -1220,6 +1266,8 @@ run_key make_key(const benchmark_options& opts, const benchmark_config& config,
 	key.terminal_rules = (config.use_terminal_rules && opts.use_terminal_rules) ? "true" : "false";
 	key.memo_backend = to_string(opts.memo_backend);
 	key.adaptive_policy = to_string(config.adaptive_policy);
+	key.reconstruct_order = opts.reconstruct_order ? "true" : "false";
+	key.reconstruction_trace = opts.reconstruction_trace ? "true" : "false";
 	return key;
 }
 
@@ -1530,6 +1578,24 @@ bool parse_cli(int argc, char** argv, benchmark_options& opts, std::string& erro
 				return false;
 			}
 		}
+		else if (arg == "--process-memory-gate") {
+			if (!parse_bool_value(value, opts.use_process_memory_gate)) {
+				error = "Invalid --process-memory-gate.";
+				return false;
+			}
+		}
+		else if (arg == "--reconstruct") {
+			if (!parse_bool_value(value, opts.reconstruct_order)) {
+				error = "Invalid --reconstruct.";
+				return false;
+			}
+		}
+		else if (arg == "--reconstruction-trace") {
+			if (!parse_bool_value(value, opts.reconstruction_trace)) {
+				error = "Invalid --reconstruction-trace.";
+				return false;
+			}
+		}
 		else if (arg == "--enable-position-filtering") {
 			if (!parse_bool_value(value, opts.position_filtering_enabled)) {
 				error = "Invalid --enable-position-filtering.";
@@ -1603,7 +1669,6 @@ bool parse_cli(int argc, char** argv, benchmark_options& opts, std::string& erro
 	}
 
 	if (opts.series != "branching" && opts.series != "lower-bounds"
-		&& opts.series != "bounds-ablation"
 		&& opts.series != "memory" && opts.series != "hard") {
 		error = "Unknown --series: " + opts.series;
 		return false;

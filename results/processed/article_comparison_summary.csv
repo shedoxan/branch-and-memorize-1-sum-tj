@@ -1,0 +1,2 @@
+raw_rows_before_filter,excluded_invalid_runner_rows,rows,complete_n_rows,incomplete_n_rows,max_rows_per_complete_n,complete_n_values,incomplete_n_values,both_solved,both_solved_all_rows,ours_solved_rate,article_solved_rate,article_error_count,objective_mismatches,median_time_ratio_primary_complete_n,median_memory_ratio_primary_complete_n,median_time_ratio_all_comparable,median_memory_ratio_all_comparable,final_config_ok
+2891,480,2411,2400,11,200,"50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100",1200,2400,2411,1.0,1.0,0,0,1.008146,0.988722,1.007978,0.988722,True

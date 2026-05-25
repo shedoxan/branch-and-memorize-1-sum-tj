@@ -53,7 +53,7 @@ def run_command(args: Sequence[str], cwd: Path, dry_run: bool = False) -> None:
 
 
 def build_release(root: Path, dry_run: bool = False) -> None:
-    if not (root / "build").exists():
+    if not (root / "build" / "CMakeCache.txt").exists():
         run_command(["cmake", "-S", ".", "-B", "build"], root, dry_run)
     run_command(["cmake", "--build", "build", "--config", "Release"], root, dry_run)
 

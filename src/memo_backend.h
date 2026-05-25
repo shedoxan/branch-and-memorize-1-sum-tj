@@ -101,6 +101,14 @@ public:
 			}, impl_);
 	}
 
+	bool store_reconstruction_trace(const std::vector<std::uint64_t>& bits, schedule_time_t time,
+		std::uint64_t subset_hash, std::uint64_t subset_fingerprint,
+		const memo_reconstruction_trace& trace, bool count_stats = true) {
+		return std::visit([&](auto& table) {
+			return table.store_reconstruction_trace(bits, time, subset_hash, subset_fingerprint, trace, count_stats);
+			}, impl_);
+	}
+
 	void store_lb(const std::vector<std::uint64_t>& bits, schedule_time_t time,
 		std::uint64_t subset_hash, std::uint64_t subset_fingerprint,
 		long long lb, bool count_stats = true) {

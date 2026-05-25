@@ -96,6 +96,7 @@ struct dfs_config {
 	std::uint64_t zobrist_seed = 1;
 	double time_limit_sec = 0.0;
 	bool reconstruct_order = true;
+	bool reconstruction_trace = false;
 
 	/// Какой точный способ ветвления использовать для состояния (S,t).
 	DecompositionMode decomposition_mode = DecompositionMode::Adaptive;

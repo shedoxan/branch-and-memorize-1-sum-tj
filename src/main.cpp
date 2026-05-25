@@ -4,6 +4,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -28,6 +29,7 @@ void on_interrupt_signal(int) {
 struct cli_options {
 	bool benchmark = false;
 	bool reconstruct_order = false;
+	bool reconstruction_trace = false;
 	bool n_from_set = false;
 	bool n_to_set = false;
 
@@ -73,17 +75,19 @@ struct cli_options {
 	std::string bench_csv_path;
 	std::string n_list_text;
 	std::string input_path;
+	std::string dump_instance_path;
 };
 
 void print_usage() {
 	std::cout
 		<< "Usage:\n"
-		<< "  kursovaya.exe [options]\n\n"
+		<< "  bm_solver.exe [options]\n\n"
 		<< "Single run options:\n"
 		<< "  --n <int>                 Number of jobs (default: 50)\n"
 		<< "  --instances <int>         Number of instances (default: 1)\n"
 		<< "  --seed <u64>              Base seed (default: 1)\n"
 		<< "  --input <path>            Solve instance from file (supports 'n + p d' and SDT 'p d' formats)\n\n"
+		<< "  --dump-instance <path>    Generate/load instance, write SDT 'p d' file, and exit\n\n"
 		<< "Benchmark options:\n"
 		<< "  --bench-csv <path>        Enable benchmark mode and write CSV\n"
 		<< "  --n-from <int>            Start n for range\n"
@@ -129,6 +133,8 @@ void print_usage() {
 		<< "  --profile-article         Preset: R=0.2 T=0.6 no-LB adaptive memo-capacity=0\n"
 		<< "  --reconstruct             Enable order reconstruction (default: off)\n"
 		<< "  --no-reconstruct          Disable order reconstruction\n"
+		<< "  --reconstruction-trace    Use split trace for order reconstruction\n"
+		<< "  --no-reconstruction-trace Disable split trace reconstruction\n"
 		<< "  --help                    Show this help\n";
 }
 
@@ -322,6 +328,34 @@ bool load_instance_from_file_auto(const std::string& path, instance& out, std::s
 	return true;
 }
 
+bool write_instance_sdt(const std::string& path, const instance& inst, std::string& error) {
+	try {
+		const std::filesystem::path out_path(path);
+		const std::filesystem::path parent = out_path.parent_path();
+		if (!parent.empty()) {
+			std::filesystem::create_directories(parent);
+		}
+
+		std::ofstream out(path, std::ios::out | std::ios::trunc);
+		if (!out) {
+			error = "Cannot open output file: " + path;
+			return false;
+		}
+		for (const job& j : inst.jobs) {
+			out << j.p << ' ' << j.d << '\n';
+		}
+		if (!out) {
+			error = "Failed to write output file: " + path;
+			return false;
+		}
+		return true;
+	}
+	catch (const std::exception& ex) {
+		error = std::string("Failed to write output file: ") + ex.what();
+		return false;
+	}
+}
+
 std::string active_components_text(const cli_options& opts) {
 	std::string components;
 	switch (opts.decomposition_mode) {
@@ -423,6 +457,15 @@ bool parse_cli(int argc, char** argv, cli_options& opts, std::string& error, boo
 		}
 		if (arg == "--reconstruct") {
 			opts.reconstruct_order = true;
+			continue;
+		}
+		if (arg == "--reconstruction-trace") {
+			opts.reconstruction_trace = true;
+			opts.reconstruct_order = true;
+			continue;
+		}
+		if (arg == "--no-reconstruction-trace") {
+			opts.reconstruction_trace = false;
 			continue;
 		}
 		if (arg == "--no-lb") {
@@ -646,6 +689,9 @@ bool parse_cli(int argc, char** argv, cli_options& opts, std::string& error, boo
 		}
 		else if (arg == "--input") {
 			opts.input_path = value;
+		}
+		else if (arg == "--dump-instance") {
+			opts.dump_instance_path = value;
 		}
 		else if (arg == "--p-min") {
 			if (!parse_int_arg(value, opts.p_min)) {
@@ -871,6 +917,7 @@ dfs_config make_solver_config(const cli_options& opts) {
 	cfg.memo.capacity = opts.memo_capacity;
 	cfg.memo.memory_limit_bytes = opts.mem_budget_mb * static_cast<std::size_t>(1024) * static_cast<std::size_t>(1024);
 	cfg.reconstruct_order = opts.reconstruct_order;
+	cfg.reconstruction_trace = opts.reconstruction_trace;
 	cfg.bounds.enable_simple_lb = option_simple_lb_enabled(opts);
 	cfg.bounds.enable_lb_memo = option_lb_memo_enabled(opts);
 	cfg.bounds.enable_edd_ub = option_edd_ub_enabled(opts);
@@ -1160,14 +1207,23 @@ bool run_single(const cli_options& opts) {
 			opts.n, opts.p_min, opts.p_max, opts.due_range, opts.due_tardiness, opts.seed);
 	}
 
+	if (!opts.dump_instance_path.empty()) {
+		std::string dump_error;
+		if (!write_instance_sdt(opts.dump_instance_path, inst, dump_error)) {
+			std::cerr << dump_error << "\n";
+			return false;
+		}
+		std::cout << "[dump-instance] path=" << opts.dump_instance_path
+			<< " n=" << inst.jobs.size()
+			<< " seed=" << opts.seed
+			<< " due_range=" << opts.due_range
+			<< " due_tardiness=" << opts.due_tardiness
+			<< "\n";
+		return true;
+	}
+
 	dfs_solver solver(cfg);
 	solve_result result = solver.solve(inst);
-	schedule_cost_t reconstructed_order_cost = 0;
-	bool reconstruction_success = !opts.reconstruct_order;
-	if (opts.reconstruct_order && !result.best.order.empty()) {
-		reconstructed_order_cost = evaluate_sum_tardiness(inst, result.best.order);
-		reconstruction_success = reconstructed_order_cost == result.best.cost;
-	}
 
 	std::cout
 		<< "[run] n=" << inst.jobs.size()
@@ -1192,8 +1248,6 @@ bool run_single(const cli_options& opts) {
 		<< " memo_full_key_verification=" << (opts.memo_full_key_verification ? 1 : 0)
 		<< " memo_memory_limit_mb=" << opts.mem_budget_mb
 		<< " cost=" << result.best.cost
-		<< " reconstruction_success=" << (reconstruction_success ? 1 : 0)
-		<< " reconstructed_order_cost=" << reconstructed_order_cost
 		<< " time_ms=" << result.stats.elapsed_ms
 		<< " nodes=" << result.stats.nodes
 		<< " max_depth=" << result.stats.max_depth
@@ -1214,6 +1268,10 @@ bool run_single(const cli_options& opts) {
 		<< " memo_final=" << result.stats.memo_final_size
 		<< " memo_evictions=" << result.stats.memo_evictions
 		<< " memo_clean_time_ms=" << result.stats.memo_clean_time_ms
+		<< " reconstruction_time_ms=" << result.stats.reconstruction_time_ms
+		<< " reconstruction_repairs=" << result.stats.reconstruction_repair_solves
+		<< " reconstruction_trace_hits=" << result.stats.reconstruction_trace_hits
+		<< " reconstruction_trace_fallbacks=" << result.stats.reconstruction_trace_fallbacks
 		<< " memo_used_mb=" << (static_cast<double>(result.stats.memo_used_bytes) / (1024.0 * 1024.0))
 		<< " memo_bytes_per_entry="
 		<< (result.stats.memo_final_size == 0

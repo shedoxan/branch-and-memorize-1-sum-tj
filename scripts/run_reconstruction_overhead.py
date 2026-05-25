@@ -47,10 +47,10 @@ def order_length(stdout: str) -> int:
     return 0
 
 
-def run_solver(kursovaya: Path, root: Path, n: int, r: float, t: float, seed: int,
+def run_solver(bm_solver: Path, root: Path, n: int, r: float, t: float, seed: int,
                reconstruct: bool, timeout_sec: int) -> dict[str, str]:
     cmd = [
-        str(kursovaya),
+        str(bm_solver),
         "--n", str(n),
         "--instances", "1",
         "--seed", str(seed),
@@ -137,7 +137,7 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    kursovaya = find_executable(root, "kursovaya.exe")
+    bm_solver = find_executable(root, "bm_solver.exe")
     fieldnames = [
         "n", "R", "T", "seed", "status", "objective",
         "solve_only_wall_time_ms", "solve_with_reconstruction_wall_time_ms",
@@ -155,8 +155,8 @@ def main() -> int:
             for r, t in pairs:
                 for seed in seeds:
                     print(f"[reconstruct] n={n} R={fmt_float(r)} T={fmt_float(t)} seed={seed}", flush=True)
-                    solve_only = run_solver(kursovaya, root, n, r, t, seed, False, timeout_sec)
-                    solve_with = run_solver(kursovaya, root, n, r, t, seed, True, timeout_sec)
+                    solve_only = run_solver(bm_solver, root, n, r, t, seed, False, timeout_sec)
+                    solve_with = run_solver(bm_solver, root, n, r, t, seed, True, timeout_sec)
                     status = "SOLVED" if solve_only.get("status") == "SOLVED" and solve_with.get("status") == "SOLVED" else "ERROR"
                     if solve_only.get("status") == "OOT" or solve_with.get("status") == "OOT":
                         status = "OOT"

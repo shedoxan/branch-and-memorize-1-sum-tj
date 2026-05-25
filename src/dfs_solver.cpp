@@ -348,6 +348,7 @@ void dfs_solver::finalize_stats_from_memo() {
 	stats_.duplicate_subproblem_hits = diags.duplicate_subproblem_hits;
 	stats_.hash_collisions = diags.hash_collisions;
 	stats_.full_key_rechecks = diags.full_key_rechecks;
+	stats_.reconstruction_trace_entries = table_stats.reconstruction_trace_entries;
 }
 
 void dfs_solver::check_time_limit() {
@@ -952,6 +953,7 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 	// для Lawler или аналогичному разрезу A,[1]_S,rest для Szwarc.
 	// pivot_completion — это C_pivot; вклад pivot равен T_pivot.
 	// fallback_first_in_before нужен только для best_job, если child memo ещё не вернул первую работу блока.
+	memo_reconstruction_trace best_reconstruction_trace{};
 	auto evaluate_branch_bits = [&](int pivot_job,
 		std::vector<std::uint64_t>& before_bits, int before_count, std::uint64_t before_hash, std::uint64_t before_fp,
 		std::vector<std::uint64_t>& after_bits, int after_count, std::uint64_t after_hash, std::uint64_t after_fp,
@@ -1017,6 +1019,21 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 				}
 				else {
 					best_first_job = fallback_first_in_before;
+				}
+				if (config_.reconstruct_order && config_.reconstruction_trace && track_stats) {
+					best_reconstruction_trace = {};
+					best_reconstruction_trace.has_trace = true;
+					best_reconstruction_trace.pivot_job = pivot_job;
+					best_reconstruction_trace.before_count = before_count;
+					best_reconstruction_trace.after_count = after_count;
+					best_reconstruction_trace.before_hash = before_hash;
+					best_reconstruction_trace.before_fingerprint = before_fp;
+					best_reconstruction_trace.after_hash = after_hash;
+					best_reconstruction_trace.after_fingerprint = after_fp;
+					best_reconstruction_trace.pivot_completion = pivot_completion;
+					best_reconstruction_trace.before_exact = OPT_before;
+					best_reconstruction_trace.pivot_tardiness = pivot_tardiness_T;
+					best_reconstruction_trace.after_exact = OPT_after;
 				}
 			}
 		};
@@ -1751,6 +1768,7 @@ long long dfs_solver::solve_state(int depth, schedule_time_t current_time, const
 	runtime_.perm_jobs[static_cast<std::size_t>(depth)] = best_first_job;
 	// После полного решения подзадачи сохраняем M[(S,t)] = OPT(S,t).
 	store_exact_memo(current_time, upper_bound_UB, best_first_job, track_stats);
+	store_reconstruction_trace(current_time, best_reconstruction_trace, track_stats);
 	return upper_bound_UB;
 }
 
@@ -1872,31 +1890,117 @@ long long dfs_solver::heuristic_upper_bound_edd(int depth, schedule_time_t curre
 	return upper_bound_UB;
 }
 
-std::vector<job_id_t> dfs_solver::reconstruct_order(long long optimal_cost) {
-	// Reconstruction идёт по exact-записям M[(S,t)].
-	// Поле best_job хранит первую работу оптимального продолжения для этого состояния.
-	// LB-запись использовать нельзя: она не содержит ни OPT(S,t), ни корректного best_job.
-	std::vector<job_id_t> order;
-	order.reserve(static_cast<std::size_t>(n_));
+void dfs_solver::store_reconstruction_trace(schedule_time_t current_time,
+	const memo_reconstruction_trace& trace,
+	bool track_stats) {
+	if (!config_.reconstruct_order || !config_.reconstruction_trace || !track_stats || !trace.has_trace) {
+		return;
+	}
+	if (memo_.store_reconstruction_trace(runtime_.remaining_bits, current_time,
+		runtime_.subset_hash, runtime_.subset_fingerprint, trace, track_stats)) {
+		++stats_.reconstruction_trace_stores;
+	}
+}
 
-	schedule_time_t current_time = 0;
-	long long remaining_optimal = optimal_cost;
+bool dfs_solver::append_terminal_order(schedule_time_t current_time, long long exact, std::vector<job_id_t>& order) {
+	if (!any_terminal_rule_enabled(config_.terminal_rules)) {
+		return false;
+	}
+	if (runtime_.remaining_count == 0) {
+		return exact == 0;
+	}
 
-	for (int depth = 0; depth < n_; ++depth) {
+	std::vector<int> edd_jobs;
+	build_remaining_jobs_in_order(runtime_.edd_order, edd_jobs);
+	if (config_.terminal_rules.enable_edd_at_most_one_tardy) {
+		long long edd_cost = 0;
+		int edd_tardy_count = 0;
+		schedule_time_t edd_time = current_time;
+		for (int job_idx : edd_jobs) {
+			const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
+			edd_time += static_cast<schedule_time_t>(j.p);
+			const schedule_cost_t tardy = tardiness(edd_time, j.d);
+			if (tardy > 0) {
+				++edd_tardy_count;
+			}
+			edd_cost += static_cast<long long>(tardy);
+		}
+		if (edd_tardy_count <= 1 && edd_cost == exact) {
+			for (int job_idx : edd_jobs) {
+				order.push_back(static_cast<job_id_t>(job_idx));
+			}
+			++stats_.reconstruction_trace_terminal_hits;
+			return true;
+		}
+	}
+
+	if (!config_.terminal_rules.enable_all_tardy_spt) {
+		return false;
+	}
+	bool all_tardy_even_first = true;
+	for (int job_idx : edd_jobs) {
+		const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
+		if (current_time + static_cast<schedule_time_t>(j.p) <= static_cast<schedule_time_t>(j.d)) {
+			all_tardy_even_first = false;
+			break;
+		}
+	}
+	if (!all_tardy_even_first) {
+		return false;
+	}
+
+	std::vector<int> lpt_jobs;
+	build_remaining_jobs_in_order(runtime_.lpt_order, lpt_jobs);
+	long long spt_cost = 0;
+	schedule_time_t spt_time = current_time;
+	for (auto it = lpt_jobs.rbegin(); it != lpt_jobs.rend(); ++it) {
+		const int job_idx = *it;
+		const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
+		spt_time += static_cast<schedule_time_t>(j.p);
+		spt_cost += static_cast<long long>(tardiness(spt_time, j.d));
+	}
+	if (spt_cost != exact) {
+		return false;
+	}
+	for (auto it = lpt_jobs.rbegin(); it != lpt_jobs.rend(); ++it) {
+		order.push_back(static_cast<job_id_t>(*it));
+	}
+	++stats_.reconstruction_trace_terminal_hits;
+	return true;
+}
+
+bool dfs_solver::append_order_linearly(schedule_time_t current_time, long long exact, std::vector<job_id_t>& order) {
+	const std::size_t start_size = order.size();
+	std::vector<int> removed;
+	removed.reserve(static_cast<std::size_t>(runtime_.remaining_count));
+
+	long long remaining_optimal = exact;
+	while (runtime_.remaining_count > 0) {
+		++stats_.reconstruction_steps;
 		int best_job = -1;
 		long long best_total = std::numeric_limits<long long>::max();
 		schedule_time_t best_completion = current_time;
 		long long best_incremental = 0;
 		bool found_exact_continuation = false;
-		// Подсказка best_job берётся только из exact-записи текущего состояния.
-		const memo_lookup_result current_lookup =
+
+		memo_lookup_result current_lookup =
 			memo_.query_exact(runtime_.remaining_bits, current_time,
 				runtime_.subset_hash, runtime_.subset_fingerprint, false);
+		bool current_exact_ok =
+			current_lookup.found && current_lookup.has_exact &&
+			current_lookup.exact == remaining_optimal;
+		if (current_exact_ok) {
+			++stats_.reconstruction_current_exact_hits;
+		}
+		else {
+			++stats_.reconstruction_current_exact_misses;
+		}
 
 		auto try_job = [&](int job_idx) {
 			if (!is_job_remaining(job_idx)) {
 				return false;
 			}
+			++stats_.reconstruction_candidate_scans;
 			const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
 			const schedule_time_t completion = current_time + static_cast<schedule_time_t>(j.p);
 			const long long incremental = static_cast<long long>(tardiness(completion, j.d));
@@ -1910,12 +2014,13 @@ std::vector<job_id_t> dfs_solver::reconstruct_order(long long optimal_cost) {
 					runtime_.subset_hash, runtime_.subset_fingerprint, false);
 			long long rest = 0;
 			if (lookup.found && lookup.has_exact) {
+				++stats_.reconstruction_child_exact_hits;
 				rest = lookup.exact;
 			}
 			else {
-				// Если exact child-entry нет, подзадача пересчитывается без статистики.
-				// Это сохраняет корректность reconstruction, но может быть дороже.
-				rest = solve_state(depth + 1, completion, nullptr, false);
+				++stats_.reconstruction_child_exact_misses;
+				++stats_.reconstruction_repair_solves;
+				rest = solve_state(n_ - runtime_.remaining_count, completion, nullptr, false);
 			}
 			restore_job_to_state(job_idx);
 
@@ -1937,10 +2042,7 @@ std::vector<job_id_t> dfs_solver::reconstruct_order(long long optimal_cost) {
 			return false;
 		};
 
-		const int hinted_job =
-			(current_lookup.found && current_lookup.has_exact && current_lookup.exact == remaining_optimal)
-			? current_lookup.best_job
-			: -1;
+		const int hinted_job = current_exact_ok ? current_lookup.best_job : -1;
 		if (hinted_job >= 0) {
 			(void)try_job(hinted_job);
 		}
@@ -1956,19 +2058,227 @@ std::vector<job_id_t> dfs_solver::reconstruct_order(long long optimal_cost) {
 		}
 
 		if (!found_exact_continuation || best_job < 0 || !is_job_remaining(best_job)) {
-			break;
+			for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
+				restore_job_to_state(*it);
+			}
+			order.resize(start_size);
+			return false;
 		}
 
 		order.push_back(static_cast<job_id_t>(best_job));
+		removed.push_back(best_job);
 		remove_job_from_state(best_job);
 		current_time = best_completion;
 		remaining_optimal -= best_incremental;
 	}
 
-	for (auto it = order.rbegin(); it != order.rend(); ++it) {
-		restore_job_to_state(static_cast<int>(*it));
+	for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
+		restore_job_to_state(*it);
 	}
-	return order;
+	return true;
+}
+
+bool dfs_solver::append_order_by_trace(schedule_time_t current_time, long long exact, std::vector<job_id_t>& order) {
+	if (runtime_.remaining_count == 0) {
+		return exact == 0;
+	}
+	if (runtime_.remaining_count == 1) {
+		for (int job_idx = 0; job_idx < n_; ++job_idx) {
+			if (!is_job_remaining(job_idx)) {
+				continue;
+			}
+			const job& j = inst_->jobs[static_cast<std::size_t>(job_idx)];
+			const schedule_time_t completion = current_time + static_cast<schedule_time_t>(j.p);
+			if (static_cast<long long>(tardiness(completion, j.d)) == exact) {
+				order.push_back(static_cast<job_id_t>(job_idx));
+				return true;
+			}
+			break;
+		}
+		++stats_.reconstruction_trace_fallbacks;
+		return append_order_linearly(current_time, exact, order);
+	}
+	if (append_terminal_order(current_time, exact, order)) {
+		return true;
+	}
+
+	memo_lookup_result trace_lookup =
+		memo_.query_exact(runtime_.remaining_bits, current_time,
+			runtime_.subset_hash, runtime_.subset_fingerprint, false);
+	if (!trace_lookup.found || !trace_lookup.has_exact ||
+		trace_lookup.exact != exact ||
+		!trace_lookup.reconstruction_trace.has_trace) {
+		++stats_.reconstruction_trace_misses;
+		++stats_.reconstruction_trace_fallbacks;
+		return append_order_linearly(current_time, exact, order);
+	}
+	++stats_.reconstruction_trace_hits;
+	const memo_reconstruction_trace& entry = trace_lookup.reconstruction_trace;
+	if (entry.pivot_job < 0 ||
+		!is_job_remaining(entry.pivot_job) ||
+		entry.before_count + entry.after_count + 1 != runtime_.remaining_count ||
+		entry.before_exact + entry.pivot_tardiness + entry.after_exact != exact) {
+		++stats_.reconstruction_trace_fallbacks;
+		return append_order_linearly(current_time, exact, order);
+	}
+
+	const std::size_t words = runtime_.remaining_bits.size();
+	std::vector<std::uint64_t> trace_before_bits(words, 0);
+	std::vector<std::uint64_t> trace_after_bits(words, 0);
+	std::uint64_t trace_before_hash = 0;
+	std::uint64_t trace_before_fingerprint = 0;
+	schedule_time_t before_processing = 0;
+	int built_before_count = 0;
+
+	std::vector<int> edd_jobs;
+	std::vector<int> lpt_jobs;
+	build_remaining_jobs_in_order(runtime_.edd_order, edd_jobs);
+	build_remaining_jobs_in_order(runtime_.lpt_order, lpt_jobs);
+	if (edd_jobs.empty() || lpt_jobs.empty()) {
+		++stats_.reconstruction_trace_fallbacks;
+		return append_order_linearly(current_time, exact, order);
+	}
+
+	auto add_before_job = [&](int job_idx) {
+		const std::size_t idx = static_cast<std::size_t>(job_idx);
+		trace_before_bits[idx >> 6] |= std::uint64_t{ 1 } << (idx & 63);
+		trace_before_hash ^= runtime_.zobrist_job[idx];
+		trace_before_fingerprint ^= runtime_.zobrist_job_fp[idx];
+		before_processing += static_cast<schedule_time_t>(inst_->jobs[idx].p);
+		++built_before_count;
+	};
+
+	const int longest_job = lpt_jobs.front();
+	const int earliest_job = edd_jobs.front();
+	bool partition_built = false;
+	if (entry.pivot_job == longest_job) {
+		for (int job_idx : edd_jobs) {
+			if (job_idx == entry.pivot_job) {
+				continue;
+			}
+			if (built_before_count >= entry.before_count) {
+				break;
+			}
+			add_before_job(job_idx);
+		}
+		partition_built = built_before_count == entry.before_count;
+	}
+	else if (entry.pivot_job == earliest_job) {
+		std::vector<unsigned char> candidate(static_cast<std::size_t>(n_), 0);
+		int earliest_pos_in_lpt = static_cast<int>(lpt_jobs.size()) - 1;
+		for (int i = 0; i < static_cast<int>(lpt_jobs.size()); ++i) {
+			if (lpt_jobs[static_cast<std::size_t>(i)] == earliest_job) {
+				earliest_pos_in_lpt = i;
+				break;
+			}
+		}
+		for (int i = earliest_pos_in_lpt + 1; i < static_cast<int>(lpt_jobs.size()); ++i) {
+			candidate[static_cast<std::size_t>(lpt_jobs[static_cast<std::size_t>(i)])] = 1;
+		}
+		for (int job_idx : edd_jobs) {
+			if (candidate[static_cast<std::size_t>(job_idx)] == 0) {
+				continue;
+			}
+			if (built_before_count >= entry.before_count) {
+				break;
+			}
+			add_before_job(job_idx);
+		}
+		partition_built = built_before_count == entry.before_count;
+	}
+	if (!partition_built) {
+		++stats_.reconstruction_trace_fallbacks;
+		return append_order_linearly(current_time, exact, order);
+	}
+
+	const std::size_t pivot_idx = static_cast<std::size_t>(entry.pivot_job);
+	for (std::size_t w = 0; w < words; ++w) {
+		trace_after_bits[w] = runtime_.remaining_bits[w] & ~trace_before_bits[w];
+	}
+	trace_after_bits[pivot_idx >> 6] &= ~(std::uint64_t{ 1 } << (pivot_idx & 63));
+	const std::uint64_t pivot_hash = runtime_.zobrist_job[pivot_idx];
+	const std::uint64_t pivot_fingerprint = runtime_.zobrist_job_fp[pivot_idx];
+	const std::uint64_t trace_after_hash = runtime_.subset_hash ^ trace_before_hash ^ pivot_hash;
+	const std::uint64_t trace_after_fingerprint =
+		runtime_.subset_fingerprint ^ trace_before_fingerprint ^ pivot_fingerprint;
+	const schedule_time_t trace_pivot_completion =
+		current_time + before_processing + static_cast<schedule_time_t>(inst_->jobs[pivot_idx].p);
+	if (trace_before_hash != entry.before_hash ||
+		trace_before_fingerprint != entry.before_fingerprint ||
+		trace_after_hash != entry.after_hash ||
+		trace_after_fingerprint != entry.after_fingerprint ||
+		trace_pivot_completion != entry.pivot_completion) {
+		++stats_.reconstruction_trace_fallbacks;
+		return append_order_linearly(current_time, exact, order);
+	}
+
+	const std::size_t start_size = order.size();
+	const std::vector<std::uint64_t> saved_bits = runtime_.remaining_bits;
+	const std::uint64_t saved_hash = runtime_.subset_hash;
+	const std::uint64_t saved_fingerprint = runtime_.subset_fingerprint;
+	const int saved_count = runtime_.remaining_count;
+
+	auto restore_parent = [&]() {
+		runtime_.remaining_bits = saved_bits;
+		runtime_.subset_hash = saved_hash;
+		runtime_.subset_fingerprint = saved_fingerprint;
+		runtime_.remaining_count = saved_count;
+	};
+	auto set_state = [&](const std::vector<std::uint64_t>& bits,
+		int count,
+		std::uint64_t hash,
+		std::uint64_t fingerprint) {
+			runtime_.remaining_bits = bits;
+			runtime_.remaining_count = count;
+			runtime_.subset_hash = hash;
+			runtime_.subset_fingerprint = fingerprint;
+	};
+
+	if (entry.before_count > 0) {
+		set_state(trace_before_bits, entry.before_count, entry.before_hash, entry.before_fingerprint);
+		if (!append_order_by_trace(current_time, entry.before_exact, order)) {
+			restore_parent();
+			order.resize(start_size);
+			return false;
+		}
+	}
+
+	order.push_back(static_cast<job_id_t>(entry.pivot_job));
+
+	if (entry.after_count > 0) {
+		set_state(trace_after_bits, entry.after_count, entry.after_hash, entry.after_fingerprint);
+		if (!append_order_by_trace(entry.pivot_completion, entry.after_exact, order)) {
+			restore_parent();
+			order.resize(start_size);
+			return false;
+		}
+	}
+
+	restore_parent();
+	return true;
+}
+
+std::vector<job_id_t> dfs_solver::reconstruct_order(long long optimal_cost) {
+	const auto reconstruction_start = std::chrono::steady_clock::now();
+	// Reconstruction идёт по exact-записям M[(S,t)].
+	// Поле best_job хранит первую работу оптимального продолжения для этого состояния.
+	// LB-запись использовать нельзя: она не содержит ни OPT(S,t), ни корректного best_job.
+	std::vector<job_id_t> order;
+	order.reserve(static_cast<std::size_t>(n_));
+
+	{
+		const bool ok = config_.reconstruction_trace
+			? append_order_by_trace(0, optimal_cost, order)
+			: append_order_linearly(0, optimal_cost, order);
+		if (!ok) {
+			order.clear();
+		}
+		const auto reconstruction_finish = std::chrono::steady_clock::now();
+		stats_.reconstruction_time_ms +=
+			std::chrono::duration<double, std::milli>(
+				reconstruction_finish - reconstruction_start).count();
+		return order;
+	}
 }
 
 memo_lookup_result dfs_solver::query_memo(schedule_time_t current_time, bool track_stats) {

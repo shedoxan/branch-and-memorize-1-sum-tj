@@ -214,6 +214,7 @@ void test_reconstruction() {
 	require_order_is_permutation(result.best.order, inst.jobs.size(), "reconstruction test");
 	require(evaluate_sum_tardiness(inst, result.best.order) == result.best.cost,
 		"reconstructed order cost should equal solver objective");
+
 }
 
 void test_final_preset() {
@@ -274,6 +275,9 @@ void test_solver_small_instances() {
 	// std::unordered_map backend используется как читаемая reference-реализация memo.
 	reference_memo.memo.backend = memo_backend_kind::std_unordered;
 
+	dfs_config trace_reconstruction = baseline;
+	trace_reconstruction.reconstruction_trace = true;
+
 	for (std::size_t i = 0; i < cases.size(); ++i) {
 		check_solver_matches_bruteforce(cases[i], baseline, "baseline_case_" + std::to_string(i));
 		check_solver_matches_bruteforce(cases[i], lawler, "lawler_case_" + std::to_string(i));
@@ -285,6 +289,8 @@ void test_solver_small_instances() {
 		check_solver_matches_bruteforce(cases[i], aggressive, "aggressive_case_" + std::to_string(i));
 		check_solver_matches_bruteforce(cases[i], reference_memo,
 			"std_unordered_memo_case_" + std::to_string(i));
+		check_solver_matches_bruteforce(cases[i], trace_reconstruction,
+			"trace_reconstruction_case_" + std::to_string(i));
 	}
 }
 

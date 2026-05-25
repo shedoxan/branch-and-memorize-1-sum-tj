@@ -1,17 +1,44 @@
+# Build outputs
 build/
+build*/
 x64/
-compare_out/
-results/
+out/
+
+# IDE files
 .vs/
 .idea/
+*.user
+
+# Native build artifacts
+*.exe
+*.ilk
+*.lib
+*.obj
+*.o
+*.pdb
+*.log
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
-*.obj
-*.o
-*.exe
-*.ilk
-*.pdb
-*.user
-*.log
+
+# Temporary experiment output
+compare_out/
+results_raw/
+*.zip
+*.rar
+*.7z
 *.csv
+
+# Keep the curated benchmark artifacts used by the report.
+!results/
+results/*
+!results/README.md
+!results/report.md
+!results/figures/
+!results/figures/*.png
+!results/processed/
+!results/processed/*.csv
+!results/latex_tables/
+!results/latex_tables/*.tex

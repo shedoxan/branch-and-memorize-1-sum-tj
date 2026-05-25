@@ -10,6 +10,21 @@
 
 #include "solver.h"
 
+struct memo_reconstruction_trace {
+	bool has_trace = false;
+	int pivot_job = -1;
+	int before_count = 0;
+	int after_count = 0;
+	std::uint64_t before_hash = 0;
+	std::uint64_t before_fingerprint = 0;
+	std::uint64_t after_hash = 0;
+	std::uint64_t after_fingerprint = 0;
+	schedule_time_t pivot_completion = 0;
+	long long before_exact = 0;
+	long long pivot_tardiness = 0;
+	long long after_exact = 0;
+};
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -32,6 +47,7 @@ struct memo_lookup_result {
 	long long lower_bound = 0;
 	/// Первая работа оптимального продолжения; имеет смысл только для exact-записи.
 	int best_job = -1;
+	memo_reconstruction_trace reconstruction_trace{};
 };
 
 /// Внутренняя статистика custom memo backend.
@@ -69,6 +85,7 @@ struct memo_table_stats {
 	std::size_t final_size = 0;
 	/// Время, потраченное на очистку/eviction.
 	double clean_time_ms = 0.0;
+	std::size_t reconstruction_trace_entries = 0;
 };
 
 /// Учёт памяти custom memo backend.
@@ -117,6 +134,8 @@ public:
 		bits_words_ = 0;
 		key_storage_.clear();
 		free_key_blocks_.clear();
+		reconstruction_traces_.clear();
+		reconstruction_trace_entries_ = 0;
 		lufo_cursor_ = 0;
 
 		stats_ = {};
@@ -133,6 +152,9 @@ public:
 		if (capacity_ > 0) {
 			entries_.reserve(capacity_);
 			slot_indices_.reserve(capacity_);
+			if (!reconstruction_traces_.empty()) {
+				reconstruction_traces_.reserve(capacity_);
+			}
 			ensure_slot_table_for_insert(capacity_);
 		}
 		while (capacity_ > 0 && entries_.size() > capacity_) {
@@ -201,6 +223,9 @@ public:
 		result.exact = entry.value;
 		result.lower_bound = entry.value;
 		result.best_job = entry.best_job;
+		if (!reconstruction_traces_.empty() && id < reconstruction_traces_.size()) {
+			result.reconstruction_trace = reconstruction_traces_[id];
+		}
 		if (count_stats) {
 			++stats_.hits;
 			++diagnostics_.duplicate_subproblem_hits;
@@ -298,6 +323,30 @@ public:
 		insert_new_entry(bits, time, subset_hash, subset_fingerprint, true, exact, exact, best_job, estimated_bytes, count_stats);
 	}
 
+	bool store_reconstruction_trace(const std::vector<std::uint64_t>& bits, schedule_time_t time,
+		std::uint64_t subset_hash, std::uint64_t subset_fingerprint,
+		const memo_reconstruction_trace& trace, bool count_stats = true) {
+		if (!trace.has_trace) {
+			return false;
+		}
+		const entry_id id = find_entry(bits, time, subset_hash, subset_fingerprint, count_stats);
+		if (id == invalid_entry_id() || !entries_[id].has_exact) {
+			return false;
+		}
+		if (!ensure_trace_storage()) {
+			if (count_stats) {
+				++stats_.rejected_no_room;
+			}
+			return false;
+		}
+		if (!reconstruction_traces_[id].has_trace) {
+			++reconstruction_trace_entries_;
+		}
+		reconstruction_traces_[id] = trace;
+		touch_entry(id);
+		return true;
+	}
+
 	/// Возвращает снимок статистики; final_size пересчитывается по текущему entries_.
 	memo_table_stats stats() const {
 		memo_table_stats s = stats_;
@@ -305,6 +354,7 @@ public:
 		if (s.peak_size < entries_.size()) {
 			s.peak_size = entries_.size();
 		}
+		s.reconstruction_trace_entries = reconstruction_trace_entries_;
 		return s;
 	}
 
@@ -459,8 +509,24 @@ private:
 		const std::size_t payload = word_count * sizeof(std::uint64_t);
 		const std::size_t slot_share = sizeof(slot_word) * 3; // приближённая доля slots_ с запасом на load factor
 		const std::size_t arena_bookkeeping = sizeof(std::size_t) * 2;
+		const std::size_t trace_payload =
+			reconstruction_traces_.empty() ? 0 : sizeof(memo_reconstruction_trace);
 		return sizeof(memo_entry) + sizeof(std::uint32_t) +
-			payload + slot_share + arena_bookkeeping;
+			payload + slot_share + arena_bookkeeping + trace_payload;
+	}
+
+	bool ensure_trace_storage() {
+		if (!reconstruction_traces_.empty()) {
+			return reconstruction_traces_.size() == entries_.size();
+		}
+		const std::size_t estimated_bytes = entries_.size() * sizeof(memo_reconstruction_trace);
+		if (memory_.strict_cap && memory_.budget_bytes > 0 &&
+			memory_.used_bytes + estimated_bytes > memory_.budget_bytes) {
+			return false;
+		}
+		reconstruction_traces_.resize(entries_.size());
+		memory_.used_bytes += estimated_bytes;
+		return true;
 	}
 
 	/// Строит hash для пары (S,t). subset_hash/subset_fingerprint описывают только S,
@@ -701,6 +767,9 @@ private:
 		entries_.push_back(std::move(entry));
 		const entry_id new_id = static_cast<entry_id>(entries_.size() - 1);
 		slot_indices_.push_back(0U);
+		if (!reconstruction_traces_.empty()) {
+			reconstruction_traces_.push_back({});
+		}
 
 		const std::size_t slot_idx = find_insert_slot_in(slots_, entry.key_hash);
 		if (slots_[slot_idx] == slot_tombstone_id && tombstones_ > 0) {
@@ -735,6 +804,10 @@ private:
 		const std::size_t removed_slot = slot_indices_[id];
 		const std::size_t removed_bytes = estimate_stored_entry_bytes();
 		const bool removed_exact = entries_[id].has_exact;
+		const bool removed_trace =
+			!reconstruction_traces_.empty() &&
+			id < reconstruction_traces_.size() &&
+			reconstruction_traces_[id].has_trace;
 
 		if (removed_slot < slots_.size() && slot_is_occupied(slots_[removed_slot])) {
 			slots_[removed_slot] = slot_tombstone_id;
@@ -747,6 +820,9 @@ private:
 		if (id != last_id) {
 			entries_[id] = std::move(entries_[last_id]);
 			slot_indices_[id] = slot_indices_[last_id];
+			if (!reconstruction_traces_.empty()) {
+				reconstruction_traces_[id] = reconstruction_traces_[last_id];
+			}
 			const std::size_t moved_slot = slot_indices_[id];
 			if (moved_slot < slots_.size() && slot_is_occupied(slots_[moved_slot])) {
 				slots_[moved_slot] = id;
@@ -754,6 +830,12 @@ private:
 		}
 		entries_.pop_back();
 		slot_indices_.pop_back();
+		if (!reconstruction_traces_.empty()) {
+			reconstruction_traces_.pop_back();
+		}
+		if (removed_trace && reconstruction_trace_entries_ > 0) {
+			--reconstruction_trace_entries_;
+		}
 		if (lufo_cursor_ >= entries_.size()) {
 			lufo_cursor_ = 0;
 		}
@@ -887,6 +969,8 @@ private:
 	std::vector<std::uint64_t> key_storage_;
 	/// Free lists блоков key_storage_ по размеру word_count.
 	std::vector<std::vector<std::uint32_t>> free_key_blocks_;
+	std::vector<memo_reconstruction_trace> reconstruction_traces_;
+	std::size_t reconstruction_trace_entries_ = 0;
 
 	/// Текущая позиция кругового LUFO-сканирования.
 	std::size_t lufo_cursor_ = 0;

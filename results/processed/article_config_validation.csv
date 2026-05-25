@@ -1,0 +1,13 @@
+check,column,expected,actual_unique_values,ok
+model/decomposition,ours_reconstruct_run_decomp,adaptive,adaptive,True
+memo_backend,ours_reconstruct_run_memo_backend,custom,custom,True
+use_ub,ours_reconstruct_run_use_ub,0,0,True
+use_lb,ours_reconstruct_run_use_lb,0,0,True
+terminal_rules,ours_reconstruct_run_terminal_rules,1,1,True
+position_filtering,ours_reconstruct_run_position_filtering_enabled,1,1,True
+lawler_basic_rules,ours_reconstruct_run_enable_lawler_basic_rules,1,1,True
+enable_memo,ours_reconstruct_run_enable_memo,1,1,True
+enable_exact_memo,ours_reconstruct_run_enable_exact_memo,1,1,True
+memo_full_key_verification,ours_reconstruct_run_memo_full_key_verification,1,1,True
+reconstructed_order_length,ours_order_length,n,100.0% rows match n,True
+trace_reconstruction_fallbacks,ours_reconstruct_run_reconstruction_trace_fallbacks,0,max=0,True

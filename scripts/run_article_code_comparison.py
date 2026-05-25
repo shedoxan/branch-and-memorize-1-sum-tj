@@ -7,18 +7,20 @@ import argparse
 import csv
 import math
 import os
-import random
 import re
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
+
+sys.dont_write_bytecode = True
 
 from experiment_utils import (
     build_release,
     find_executable,
     fmt_float,
     parse_csv_list,
-    read_rows,
     repo_root_from_script,
     reset_output_dir,
     run_ctest,
@@ -47,6 +49,8 @@ OUR_RUN_KEYS = [
     "valid_pos_pruned_3a", "valid_pos_pruned_3b", "memo_rejected",
     "memo_forced_evict", "lufo_passes", "terminal_spt", "terminal_edd",
     "memo_peak", "memo_final", "memo_evictions", "memo_clean_time_ms",
+    "reconstruction_time_ms", "reconstruction_repairs",
+    "reconstruction_trace_hits", "reconstruction_trace_fallbacks",
     "memo_used_mb", "memo_bytes_per_entry",
 ]
 
@@ -100,7 +104,9 @@ def process_working_set_bytes(pid: int) -> int:
         return 0
 
 
-def run_process(command, cwd: str | None, timeout_sec: int, shell: bool) -> tuple[int | None, str, str, float, int, bool]:
+def run_process(command, cwd: str | None, timeout_sec: int, shell: bool,
+                stop_when_output_matches: re.Pattern[str] | None = None
+                ) -> tuple[int | None, str, str, float, int, bool, bool]:
     start = time.perf_counter()
     peak_bytes = 0
     proc = subprocess.Popen(
@@ -112,18 +118,51 @@ def run_process(command, cwd: str | None, timeout_sec: int, shell: bool) -> tupl
         stderr=subprocess.PIPE,
         shell=shell,
     )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def read_stream(stream, chunks: list[str]) -> None:
+        try:
+            for chunk in iter(stream.readline, ""):
+                chunks.append(chunk)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    stdout_thread = threading.Thread(target=read_stream, args=(proc.stdout, stdout_chunks), daemon=True)
+    stderr_thread = threading.Thread(target=read_stream, args=(proc.stderr, stderr_chunks), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
     timed_out = False
+    stopped_on_output = False
     while proc.poll() is None:
         peak_bytes = max(peak_bytes, process_working_set_bytes(proc.pid))
+        if stop_when_output_matches is not None:
+            text_so_far = "".join(stdout_chunks) + "\n" + "".join(stderr_chunks)
+            if stop_when_output_matches.search(text_so_far):
+                stopped_on_output = True
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                break
         if time.perf_counter() - start > timeout_sec:
             timed_out = True
             proc.kill()
             break
         time.sleep(0.05)
     peak_bytes = max(peak_bytes, process_working_set_bytes(proc.pid))
-    stdout, stderr = proc.communicate()
+    proc.wait()
+    stdout_thread.join(timeout=5.0)
+    stderr_thread.join(timeout=5.0)
+    stdout = "".join(stdout_chunks)
+    stderr = "".join(stderr_chunks)
     wall_ms = (time.perf_counter() - start) * 1000.0
-    return proc.returncode, stdout, stderr, wall_ms, peak_bytes, timed_out
+    return proc.returncode, stdout, stderr, wall_ms, peak_bytes, timed_out, stopped_on_output
 
 
 def find_run_line(stdout: str) -> str:
@@ -186,30 +225,41 @@ def memo_used_bytes_from_run(parsed: dict[str, str]) -> str:
     return str(int(round(mb * 1024.0 * 1024.0)))
 
 
+def article_grid_float(value: float) -> str:
+    """Filename token expected by the original Branch.exe benchmark grid."""
+    rounded = round(value)
+    if abs(value - rounded) < 1e-12:
+        return f"{rounded:.1f}"
+    return fmt_float(value)
+
+
 def instance_path(data_root: Path, n: int, r: float, t: float, seed: int, offset: int) -> Path:
     file_seed = seed + offset
-    return data_root / str(n) / f"SDT_{n}_{fmt_float(r)}_{fmt_float(t)}_{file_seed}.txt"
+    return data_root / str(n) / f"SDT_{n}_{article_grid_float(r)}_{article_grid_float(t)}_{file_seed}.txt"
 
 
-def generate_shared_instance_file(data_root: Path, n: int, r: float, t: float, seed: int,
-                                  offset: int, p_min: int = 1, p_max: int = 100) -> Path:
-    """Generate one shared Potts-style instance file read by both solvers."""
-    rng = random.Random(seed)
-    processing_times = [rng.randint(p_min, p_max) for _ in range(n)]
-    total_processing = sum(processing_times)
-    lower_factor = 1.0 - t - r * 0.5
-    upper_factor = 1.0 - t + r * 0.5
-    due_low = int(float(total_processing) * lower_factor)
-    due_high = int(float(total_processing) * upper_factor)
-    if due_low > due_high:
-        due_low, due_high = due_high, due_low
-    due_dates = [max(0, rng.randint(due_low, due_high)) for _ in range(n)]
-
+def generate_shared_instance_file(bm_solver: Path, root: Path, data_root: Path, n: int,
+                                  r: float, t: float, seed: int, offset: int) -> Path:
+    """Generate one shared instance via the project C++ generator."""
     path = instance_path(data_root, n, r, t, seed, offset)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as f:
-        for p, d in zip(processing_times, due_dates):
-            f.write(f"{p} {d}\n")
+    cmd = [
+        str(bm_solver),
+        "--n", str(n),
+        "--p-min", "1",
+        "--p-max", "100",
+        "--due-range", fmt_float(r),
+        "--due-tardiness", fmt_float(t),
+        "--seed", str(seed),
+        "--dump-instance", str(path),
+    ]
+    completed = subprocess.run(
+        cmd, cwd=str(root), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "project generator failed: "
+            + completed.stderr.strip()
+            + ("\n" + completed.stdout.strip() if completed.stdout.strip() else ""))
     return path
 
 
@@ -222,7 +272,8 @@ def article_instance_id(r: float, t: float, seed: int) -> int:
     return int(r_index * 40 + t_index * 10 + seed + 1)
 
 
-def prepare_article_config(article_exe: str, explicit_config: str, out_dir: Path, memory_limit_mb: int) -> str:
+def prepare_article_config(article_exe: str, explicit_config: str, out_dir: Path,
+                           article_work_dir: Path, memory_limit_mb: int) -> str:
     """Create a config for one-instance article runs without ONLY_HARDEST filtering."""
     if not article_exe:
         return explicit_config
@@ -230,7 +281,9 @@ def prepare_article_config(article_exe: str, explicit_config: str, out_dir: Path
     if not source.exists():
         return str(source)
 
-    target = out_dir / "article_config_generated.ini"
+    target_dir = article_work_dir if article_work_dir else out_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / "article_config_generated.ini"
     lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
     replaced_hardest = False
     with target.open("w", encoding="utf-8", newline="\n") as f:
@@ -246,13 +299,14 @@ def prepare_article_config(article_exe: str, explicit_config: str, out_dir: Path
             f.write("ONLY_HARDEST=0\n")
         if not any(line.startswith("RAM_LIM_MO=") for line in lines):
             f.write(f"RAM_LIM_MO={memory_limit_mb}\n")
-    return str(target)
+    # The original Branch.exe resolves argv[1] relative to the working directory.
+    return target.name
 
 
-def run_ours(kursovaya: Path, root: Path, n: int, r: float, t: float, seed: int,
+def run_ours(bm_solver: Path, root: Path, n: int, r: float, t: float, seed: int,
              input_path: Path, timeout_sec: int, reconstruct: bool, memory_limit_mb: int) -> dict[str, str]:
     cmd = [
-        str(kursovaya),
+        str(bm_solver),
         "--model", "adaptive_v3",
         "--memo-backend", "custom",
         "--memo-full-key-verification",
@@ -264,12 +318,13 @@ def run_ours(kursovaya: Path, root: Path, n: int, r: float, t: float, seed: int,
         "--enable-rule4",
         "--no-lb",
         "--no-ub",
+        "--reconstruction-trace",
         "--mem-budget-mb", str(memory_limit_mb),
     ]
     cmd.append("--reconstruct" if reconstruct else "--no-reconstruct")
     cmd += ["--seed", str(seed)]
     cmd += ["--input", str(input_path)]
-    returncode, stdout, stderr, wall_ms, peak_bytes, timed_out = run_process(
+    returncode, stdout, stderr, wall_ms, peak_bytes, timed_out, _ = run_process(
         cmd, str(root), timeout_sec, shell=False)
     if timed_out:
         return {"status": "OOT", "wall_time_ms": f"{timeout_sec * 1000.0:.3f}", "error": "subprocess_timeout"}
@@ -310,8 +365,11 @@ def run_article(command_template: str, article_exe: str, article_config: str, in
     else:
         command = [article_exe, article_config, str(n), str(art_id)]
         shell = False
-    returncode, stdout, stderr, wall_ms, peak_bytes, timed_out = run_process(
-        command, cwd, timeout_sec, shell=shell)
+    article_done_regex = re.compile(
+        r"(?:TT|objective|optimum|cost|value)\D+(\d+)[\s\S]*NbBytesMem\s*=",
+        re.IGNORECASE)
+    returncode, stdout, stderr, wall_ms, peak_bytes, timed_out, stopped_on_output = run_process(
+        command, cwd, timeout_sec, shell=shell, stop_when_output_matches=article_done_regex)
     if timed_out:
         return {"status": "OOT", "objective": "", "wall_time_ms": f"{timeout_sec * 1000.0:.3f}", "error": "subprocess_timeout"}
     text = stdout + "\n" + stderr
@@ -320,13 +378,13 @@ def run_article(command_template: str, article_exe: str, article_config: str, in
     memo_match = ARTICLE_MEM_RE.search(text)
     ram_match = ARTICLE_RAM_RE.search(text)
     result = {
-        "status": "SOLVED" if returncode == 0 and objective_match else "ERROR",
+        "status": "SOLVED" if (returncode == 0 or stopped_on_output) and objective_match else "ERROR",
         "objective": objective_match.group(1) if objective_match else "",
         "wall_time_ms": f"{wall_ms:.3f}",
         "process_peak_working_set_bytes": str(peak_bytes),
         "memo_bytes": memo_match.group(1) if memo_match else "",
         "reported_ram_bytes": ram_match.group(1) if ram_match else "",
-        "error": "" if returncode == 0 else text.strip()[:500],
+        "error": "" if (returncode == 0 or stopped_on_output) else text.strip()[:500],
         "raw_metrics": ";".join(f"{k}={v}" for k, v in sorted(article_metrics.items())),
     }
     for key in ARTICLE_METRIC_KEYS:
@@ -354,8 +412,8 @@ def write_summary(path: Path, rows: list[dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         f.write("# Article Code Comparison Summary\n\n")
         f.write(f"- rows: {len(rows)}\n")
-        f.write("- data_mode: generated_shared_instances\n")
-        f.write("- ours_config: adaptive_v3 + custom memo + reconstruction + no process-memory gate\n")
+        f.write("- data_mode: generated_by_project_generator\n")
+        f.write("- ours_config: adaptive_v3 + custom memo + reconstruction trace + no process-memory gate\n")
         f.write(f"- ours_solved: {ours_solved}\n")
         f.write(f"- article_solved: {article_solved}\n")
         f.write(f"- ours_oot: {ours_oot}\n")
@@ -406,12 +464,13 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    kursovaya = find_executable(root, "kursovaya.exe")
-    print(f"[article] ours_exe={kursovaya}", flush=True)
+    bm_solver = find_executable(root, "bm_solver.exe")
+    print(f"[article] ours_exe={bm_solver}", flush=True)
     shared_work_dir = Path(args.shared_work_dir) if args.shared_work_dir else out_dir
     data_root = shared_work_dir / "data"
     memory_limit_mb = int(round(args.memory_limit_gb * 1024.0))
-    article_config = prepare_article_config(args.article_exe, args.article_config, out_dir, memory_limit_mb)
+    article_config = prepare_article_config(
+        args.article_exe, args.article_config, out_dir, shared_work_dir, memory_limit_mb)
     objective_regex = re.compile(args.article_objective_regex, re.IGNORECASE)
     fieldnames = [
         "n", "R", "T", "seed", "instance_path", "shared_work_dir", "data_mode", "ours_exe",
@@ -442,12 +501,12 @@ def main() -> int:
             for r in r_values:
                 for t in t_values:
                     for seed in seeds:
-                        inst_for_run = generate_shared_instance_file(
-                            data_root, n, r, t, seed, args.file_seed_offset)
                         notes = ""
+                        inst_for_run = generate_shared_instance_file(
+                            bm_solver, root, data_root, n, r, t, seed, args.file_seed_offset)
                         print(f"[article] n={n} R={fmt_float(r)} T={fmt_float(t)} seed={seed}", flush=True)
                         ours_reconstruct = run_ours(
-                            kursovaya, root, n, r, t, seed, inst_for_run, timeout_sec, True, memory_limit_mb)
+                            bm_solver, root, n, r, t, seed, inst_for_run, timeout_sec, True, memory_limit_mb)
                         article = run_article(
                             args.article_command_template,
                             args.article_exe,
@@ -495,8 +554,8 @@ def main() -> int:
                             "seed": str(seed),
                             "instance_path": str(inst_for_run) if inst_for_run else "",
                             "shared_work_dir": str(shared_work_dir),
-                            "data_mode": "generated_shared",
-                            "ours_exe": str(kursovaya),
+                            "data_mode": "generated_by_project_generator",
+                            "ours_exe": str(bm_solver),
                             "ours_reconstruct_status": ours_reconstruct.get("status", ""),
                             "ours_reconstruct_objective": ours_reconstruct.get("cost", ""),
                             "ours_reconstruct_reported_time_ms": ours_reconstruct.get("time_ms", ""),
